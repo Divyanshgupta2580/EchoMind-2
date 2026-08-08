@@ -1,12 +1,13 @@
 """
 LLM client for OpenRouter API.
 
-Provides async interface for text generation with tool calling support.
-Unified client for all LLM interactions in the bot.
+Provides async interface for text generation with structured output support,
+multi-turn chat, robust JSON parsing, and fallback model capabilities.
 """
 
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -17,29 +18,30 @@ from utils.api import OPENROUTER_URL, get_openrouter_headers
 logger = logging.getLogger(__name__)
 
 
+def _clean_and_parse_json(text: str) -> dict[str, Any]:
+    """Clean markdown code fences or prefix/suffix text and parse JSON safely."""
+    clean = text.strip()
+    if "```json" in clean:
+        clean = clean.split("```json", 1)[1].split("```", 1)[0].strip()
+    elif "```" in clean:
+        clean = clean.split("```", 1)[1].split("```", 1)[0].strip()
+    
+    # Match outermost JSON object if extra text exists
+    match = re.search(r"(\{.*\})", clean, re.DOTALL)
+    if match:
+        clean = match.group(1)
+
+    return json.loads(clean)
+
+
 class LLMClient:
-    """Async client for OpenRouter LLM API."""
+    """Async client for OpenRouter LLM API with resilient fallback parsing."""
 
     def __init__(self, model: str = LLM_MODEL):
-        """
-        Initialize LLM client.
-
-        Args:
-            model: Model identifier for OpenRouter.
-        """
         self.model = model
 
     async def generate(self, system: str, user: str) -> str:
-        """
-        Generate text completion.
-
-        Args:
-            system: System prompt defining behavior.
-            user: User message to respond to.
-
-        Returns:
-            Generated text response.
-        """
+        """Generate text completion."""
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
@@ -52,14 +54,12 @@ class LLMClient:
                 json={
                     "model": self.model,
                     "messages": messages,
-                    "max_tokens": 500
+                    "max_tokens": 800
                 }
             )
             response.raise_for_status()
             data = response.json()
-
             content = data["choices"][0]["message"]["content"]
-            logger.info(f"Generated response: {content[:100]}...")
             return content
 
     async def generate_structured(
@@ -68,62 +68,42 @@ class LLMClient:
         user: str,
         response_format: dict[str, Any]
     ) -> dict[str, Any]:
-        """
-        Generate structured JSON output.
-
-        Args:
-            system: System prompt defining behavior.
-            user: User message to respond to.
-            response_format: JSON schema for structured output.
-
-        Returns:
-            Parsed JSON response.
-        """
+        """Generate structured JSON output with schema enforcement and resilient parsing."""
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
         ]
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                OPENROUTER_URL,
-                headers=get_openrouter_headers(),
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "max_tokens": 500,
-                    "response_format": response_format
-                }
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            content = data["choices"][0]["message"]["content"]
-            logger.info(f"Generated structured response: {content}")
-
-            return json.loads(content)
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(
+                    OPENROUTER_URL,
+                    headers=get_openrouter_headers(),
+                    json={
+                        "model": self.model,
+                        "messages": messages,
+                        "max_tokens": 1200,
+                        "response_format": response_format
+                    }
+                )
+                response.raise_for_status()
+                data = response.json()
+                content = data["choices"][0]["message"]["content"]
+                return _clean_and_parse_json(content)
+        except Exception as e:
+            logger.warning(f"[LLM] Structured generation API call returned error: {e}")
+            raise
 
     async def chat(
         self,
         messages: list[dict[str, Any]],
         response_format: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """
-        Multi-turn chat completion with optional structured output.
-
-        Used for agent flows where conversation history matters.
-
-        Args:
-            messages: List of message dicts with role and content.
-            response_format: Optional JSON schema for structured output.
-
-        Returns:
-            Parsed JSON response if response_format provided, else raw content dict.
-        """
+        """Multi-turn chat completion with optional structured output."""
         payload = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": 1024
+            "max_tokens": 1200
         }
 
         if response_format:
@@ -139,8 +119,6 @@ class LLMClient:
             data = response.json()
 
             content = data["choices"][0]["message"]["content"]
-            logger.info(f"Chat response: {content[:200]}...")
-
             if response_format:
-                return json.loads(content)
+                return _clean_and_parse_json(content)
             return {"content": content}

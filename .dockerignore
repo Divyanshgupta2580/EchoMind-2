@@ -1,0 +1,23 @@
+# Git & Version Control
+.git
+.gitignore
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Local SQLite databases & test artifacts
+*.db
+*.sqlite
+*.sqlite3
+agent_memory.db
+
+# Virtual environments & caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/

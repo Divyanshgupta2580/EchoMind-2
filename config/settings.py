@@ -1,9 +1,10 @@
 """
 Application settings using Pydantic Settings.
 
-Loads configuration from environment variables and .env file.
+Loads configuration from environment variables and .env file with resilient defaults.
 """
 
+import os
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,33 +14,30 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False
+        case_sensitive=False,
+        extra="ignore"
     )
 
-    # OpenRouter API (used for both LLM and image generation)
-    openrouter_api_key: str
+    # OpenRouter API (used for LLM inference & web search)
+    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
 
-    # Twitter API credentials
-    twitter_api_key: str
-    twitter_api_secret: str
-    twitter_access_token: str
-    twitter_access_secret: str
-    twitter_bearer_token: str
+    # Twitter API credentials (optional / legacy)
+    twitter_api_key: str = os.getenv("TWITTER_API_KEY", "")
+    twitter_api_secret: str = os.getenv("TWITTER_API_SECRET", "")
+    twitter_access_token: str = os.getenv("TWITTER_ACCESS_TOKEN", "")
+    twitter_access_secret: str = os.getenv("TWITTER_ACCESS_SECRET", "")
+    twitter_bearer_token: str = os.getenv("TWITTER_BEARER_TOKEN", "")
 
-    # PostgreSQL database
-    database_url: str
+    # Database configuration
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///agent_memory.db")
 
-    # Bot configuration
+    # Publishing and cycle configuration
+    agent_interval_minutes: int = int(os.getenv("AGENT_INTERVAL_MINUTES", "2"))
     post_interval_minutes: int = 30
     mentions_interval_minutes: int = 20
-    enable_image_generation: bool = True
-
-    # Unified Agent (new architecture)
+    enable_image_generation: bool = False
     use_unified_agent: bool = True
-    agent_interval_minutes: int = 30
-
-    # Feature toggles
-    allow_mentions: bool = True  # Set to false to disable mentions even if tier allows
+    allow_mentions: bool = False
 
 
 # Global settings instance

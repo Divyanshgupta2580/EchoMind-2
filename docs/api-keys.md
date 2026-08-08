@@ -1,149 +1,43 @@
-# Getting API Keys
+# API Keys and Configuration Guide
 
-This guide explains how to obtain the required API keys for running your Twitter Agent.
-
-## Twitter API Keys
-
-### Step 1: Create Developer Account
-
-1. Go to [developer.twitter.com](https://developer.twitter.com)
-2. Sign in with your Twitter account
-3. Apply for developer access (if not already approved)
-
-### Step 2: Create a Project and App
-
-1. Go to Developer Portal → Projects & Apps
-2. Click "Create Project"
-3. Fill in project details:
-   - Project name: e.g., "My Twitter Agent"
-   - Use case: Select appropriate option
-4. Create an App within the project
-
-### Step 3: Get API Keys
-
-In your App settings, you'll find:
-
-| Key | Location | Description |
-|-----|----------|-------------|
-| `TWITTER_API_KEY` | Keys and tokens → API Key | Also called Consumer Key |
-| `TWITTER_API_SECRET` | Keys and tokens → API Secret | Also called Consumer Secret |
-| `TWITTER_BEARER_TOKEN` | Keys and tokens → Bearer Token | For read-only requests |
-| `TWITTER_ACCESS_TOKEN` | Keys and tokens → Access Token | For posting tweets |
-| `TWITTER_ACCESS_SECRET` | Keys and tokens → Access Token Secret | For posting tweets |
-
-### Step 4: Set Permissions
-
-1. Go to App settings → User authentication settings
-2. Click "Set up"
-3. Configure:
-   - App permissions: **Read and write**
-   - Type of App: **Web App, Automated App or Bot**
-   - Callback URL: `https://example.com` (placeholder)
-   - Website URL: Your website or Twitter profile
-4. Save and regenerate tokens if needed
-
-### Important Notes
-
-- **Free tier** allows posting but NOT reading mentions
-- **Basic tier** ($100/month) required for mention replies
-- Keep your keys secret - never commit them to git
+This guide explains how to configure API keys for running the Autonomous AI & Technology Persona.
 
 ---
 
-## OpenRouter API Key
+## 1. OpenRouter API Key (Required for Live Operations)
 
-OpenRouter provides access to multiple LLM and image generation models through a single API.
+OpenRouter provides access to frontier LLMs and real-time live web search plugins through a single unified API.
 
-### Step 1: Create Account
-
+### Obtaining Your Key:
 1. Go to [openrouter.ai](https://openrouter.ai)
-2. Sign up with Google/GitHub or email
-
-### Step 2: Add Credits
-
-1. Go to Account → Credits
-2. Add credits (minimum $5 recommended to start)
-3. Enable auto-recharge if desired
-
-### Step 3: Generate API Key
-
-1. Go to [openrouter.ai/keys](https://openrouter.ai/keys)
-2. Click "Create Key"
-3. Name it (e.g., "Twitter Agent")
-4. Copy the key (starts with `sk-or-v1-...`)
-
-### Models Used
-
-The agent uses these models by default:
-
-| Purpose | Model | ~Cost per call |
-|---------|-------|----------------|
-| Text Generation | `anthropic/claude-sonnet-4` | ~$0.003-0.01 |
-| Image Generation | `google/gemini-2.0-flash-exp:free` | Free |
-
-### Cost Estimate
-
-Typical monthly costs with default settings (posting every 30 min):
-
-- ~1,440 posts/month
-- ~$5-15/month on OpenRouter
-- Image generation is free with Gemini
+2. Sign up and navigate to **Keys** (`openrouter.ai/keys`)
+3. Create a new API key and copy its value.
+4. Add it to your `.env` file or environment variables:
+   ```bash
+   OPENROUTER_API_KEY=sk-or-v1-...
+   ```
 
 ---
 
-## PostgreSQL Database
+## 2. Persistent Storage Configuration
 
-### Option 1: Railway (Recommended)
-
-Railway automatically provisions PostgreSQL and sets `DATABASE_URL`.
-
-### Option 2: Supabase
-
-1. Go to [supabase.com](https://supabase.com)
-2. Create new project
-3. Go to Settings → Database
-4. Copy the "Connection string" (URI format)
-
-Format: `postgresql://postgres:[PASSWORD]@db.[PROJECT].supabase.co:5432/postgres`
-
-### Option 3: Neon
-
-1. Go to [neon.tech](https://neon.tech)
-2. Create account and project
-3. Copy the connection string from dashboard
-
-### Option 4: Self-hosted
-
-See [vps.md](vps.md) for PostgreSQL setup on your own server.
-
----
-
-## Environment Variables Summary
+The system uses SQLite with WAL mode by default.
 
 ```bash
-# Twitter API
-TWITTER_API_KEY=your_api_key
-TWITTER_API_SECRET=your_api_secret
-TWITTER_ACCESS_TOKEN=your_access_token
-TWITTER_ACCESS_SECRET=your_access_secret
-TWITTER_BEARER_TOKEN=your_bearer_token
-
-# OpenRouter
-OPENROUTER_API_KEY=sk-or-v1-...
-
-# Database
-DATABASE_URL=postgresql://user:pass@host:5432/dbname
-
-# Bot Settings
-POST_INTERVAL_MINUTES=30
-MENTIONS_INTERVAL_MINUTES=20
-ENABLE_IMAGE_GENERATION=true
+# Optional: Set custom path for SQLite database
+AGENT_DB_PATH=/data/agent_memory.db
 ```
 
-## Security Best Practices
+---
 
-1. **Never commit keys to git** - use `.env` files
-2. **Use environment variables** on hosting platforms
-3. **Rotate keys** periodically
-4. **Use separate keys** for development and production
-5. **Monitor usage** on OpenRouter dashboard
+## 3. Optional / Legacy Twitter Integration
+
+> [!NOTE]
+> Twitter API integration is legacy/out of scope for the AI Autonomy Hackathon specification. The autonomous persona operates completely independently via the Evaluator API (`/api/agent/init` and `/api/agent/feed`).
+
+If running legacy Twitter posting mode:
+- `TWITTER_API_KEY`: Consumer API Key
+- `TWITTER_API_SECRET`: Consumer API Secret
+- `TWITTER_ACCESS_TOKEN`: User Access Token
+- `TWITTER_ACCESS_SECRET`: User Access Secret
+- `TWITTER_BEARER_TOKEN`: Application Bearer Token

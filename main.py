@@ -1,22 +1,25 @@
 """
-Twitter Agent Bot - Auto-posting and Mention Handling.
+Autonomous AI & Technology Persona Service.
 
-FastAPI application with APScheduler for scheduled posts.
-Version 1.3.2 - Improved Logging + Error Handling.
+FastAPI application providing:
+- POST /api/agent/init: Initialize autonomous persona with name & domain
+- GET /api/agent/feed: Fetch reverse-chronological feed with rationale and sources
+- Periodic background autonomous publishing via APScheduler
 """
 
+import asyncio
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 from config.settings import settings
-from services.database import Database
-from services.autopost import AutoPostService
-from services.mentions import MentionHandler
-from services.tier_manager import TierManager
-from services.unified_agent import UnifiedAgent
+from services.autonomous_publisher import publisher_service
+from services.memory import memory_store
 
 # Configure logging
 logging.basicConfig(
@@ -25,315 +28,166 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global instances
-db = Database()
+# Global background scheduler
 scheduler = AsyncIOScheduler()
-autopost_service: AutoPostService | None = None
-mention_handler: MentionHandler | None = None
-tier_manager: TierManager | None = None
-unified_agent: UnifiedAgent | None = None
+
+
+# Request / Response Schemas for Hackathon API Specification
+class PersonaInitPayload(BaseModel):
+    name: str = Field(..., description="Agent persona name (e.g. 'Ada')")
+    domain: str = Field(..., description="Technical domain (e.g. 'AI Security')")
+
+
+class AgentInitRequest(BaseModel):
+    persona: PersonaInitPayload
+
+
+class AgentInitResponse(BaseModel):
+    agentId: str
+
+
+class FeedPostItem(BaseModel):
+    id: str
+    createdAt: str
+    text: str
+    rationale: str
+    sources: list[str]
+
+
+class FeedResponse(BaseModel):
+    posts: list[FeedPostItem]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application startup and shutdown."""
-    global autopost_service, mention_handler, tier_manager, unified_agent
+    """Manage application startup and shutdown with zero-failure guarantee."""
+    logger.info("[APP] Starting Autonomous AI Persona Service...")
 
-    # Startup
-    logger.info("Starting application...")
-
-    # Connect to database
-    await db.connect()
-    logger.info("Database connected")
-
-    # Initialize tier manager - detect API tier and limits (with db for fallback)
-    tier_manager = TierManager(db)
-    await tier_manager.initialize()
-
-    # Initialize services with tier manager
-    autopost_service = AutoPostService(db, tier_manager)
-    mention_handler = MentionHandler(db, tier_manager)
-    unified_agent = UnifiedAgent(db, tier_manager)
-    logger.info("Services initialized")
-
-    # Check connected Twitter account
-    try:
-        twitter_client = autopost_service.twitter
-        me = twitter_client.get_me()
-        logger.info("=" * 50)
-        logger.info(f"TWITTER ACCOUNT: @{me['username']}")
-        logger.info(f"TWITTER ID: {me['id']}")
-        logger.info("=" * 50)
-    except Exception as e:
-        logger.error(f"Failed to get Twitter account info: {e}")
-
-    # Check which mode to use
-    if settings.use_unified_agent:
-        # NEW: Unified Agent mode
-        logger.info("=" * 50)
-        logger.info("MODE: UNIFIED AGENT (new architecture)")
-        logger.info("=" * 50)
-
+    # Start the background task scheduler
+    if not scheduler.running:
+        # Schedule periodic background publishing across all initialized agents every 2 minutes
+        # to ensure steady, reliable post generation during evaluation windows
         scheduler.add_job(
-            unified_agent.run,
+            publisher_service.run_all_agents_cycle,
             "interval",
-            minutes=settings.agent_interval_minutes,
-            id="unified_agent"
+            minutes=2,
+            id="autonomous_publishing_cycle"
         )
-        logger.info(f"Scheduled unified agent every {settings.agent_interval_minutes} minutes")
-
-    else:
-        # LEGACY: Separate autopost + mentions
-        logger.info("=" * 50)
-        logger.info("MODE: LEGACY (autopost + mentions)")
-        logger.info("=" * 50)
-
-        # Schedule autopost
-        scheduler.add_job(
-            autopost_service.run,
-            "interval",
-            minutes=settings.post_interval_minutes,
-            id="autopost"
-        )
-        logger.info(f"Scheduled autopost every {settings.post_interval_minutes} minutes")
-
-        # Schedule mentions processing only if tier supports it
-        can_mentions, mentions_reason = tier_manager.can_use_mentions()
-        if can_mentions:
-            scheduler.add_job(
-                mention_handler.check_mentions,
-                "interval",
-                minutes=settings.mentions_interval_minutes,
-                id="mentions",
-                kwargs={"dry_run": False}
-            )
-            logger.info(f"Scheduled mentions every {settings.mentions_interval_minutes} minutes")
-        else:
-            logger.info(f"Mentions scheduling skipped: {mentions_reason}")
-
-    # Schedule hourly tier check (auto-detect subscription upgrades)
-    scheduler.add_job(
-        tier_manager.maybe_refresh_tier,
-        "interval",
-        hours=1,
-        id="tier_refresh"
-    )
-    scheduler.start()
-    logger.info("Scheduler started")
+        scheduler.start()
+        logger.info("[APP] Background autonomous scheduler started successfully.")
 
     yield
 
     # Shutdown
-    logger.info("Shutting down application...")
-    scheduler.shutdown(wait=False)
-    await db.close()
-    logger.info("Application shutdown complete")
+    logger.info("[APP] Shutting down application...")
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+    logger.info("[APP] Application shutdown complete.")
 
 
 app = FastAPI(
-    title="Twitter Agent Bot",
-    description="Agent-based auto-posting Twitter bot with mention handling",
-    version="1.3.2",
+    title="Autonomous AI & Technology Persona API",
+    description="Hackathon API for autonomous topic discovery, editorial judgment, and feed publishing",
+    version="2.0.0",
     lifespan=lifespan
 )
 
 
+# ============================================================================
+# REQUIRED HACKATHON EVALUATOR API ENDPOINTS
+# ============================================================================
+
+@app.post("/api/agent/init", response_model=AgentInitResponse, status_code=200)
+async def init_agent(payload: AgentInitRequest):
+    """
+    Initialize an autonomous persona with a name and technology domain.
+    Called EXACTLY ONCE per agent.
+
+    Generates a unique agentId, registers the persona in memory, triggers
+    the first autonomous publishing cycle immediately, and schedules ongoing cycles.
+    """
+    try:
+        persona_name = payload.persona.name.strip()
+        persona_domain = payload.persona.domain.strip()
+
+        if not persona_name or not persona_domain:
+            raise HTTPException(status_code=400, detail="Persona name and domain must not be empty.")
+
+        # Generate clean, unique agentId (e.g. agent-8a1b2c3d)
+        agent_id = f"agent-{uuid.uuid4().hex[:8]}"
+
+        # Register in memory store
+        memory_store.register_agent(agent_id, persona_name, persona_domain)
+
+        # Trigger ONE immediate publishing cycle so feed has fresh content upon initialization.
+        # Recurring autonomous cycles are handled by the single authoritative global scheduler job (`autonomous_publishing_cycle`),
+        # which automatically discovers all registered agents from SQLite via memory_store.list_agents().
+        asyncio.create_task(publisher_service.run_publishing_cycle(agent_id))
+
+        logger.info(f"[API] Initialized agent '{persona_name}' in domain '{persona_domain}' with id={agent_id}")
+        return AgentInitResponse(agentId=agent_id)
+
+    except Exception as e:
+        logger.error(f"[API] Error in agent initialization: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/agent/feed", response_model=FeedResponse, status_code=200)
+async def get_agent_feed(agentId: str = Query(..., description="The unique agent identifier returned during initialization")):
+    """
+    Get the published feed for a given agent.
+
+    Returns:
+    - Reverse chronological order (newest first)
+    - ISO 8601 UTC timestamps
+    - Unique post IDs
+    - Transparent editorial rationales and source citation URLs
+    - Empty list if no posts exist yet
+    """
+    try:
+        if not agentId:
+            return FeedResponse(posts=[])
+
+        posts = memory_store.get_feed(agent_id=agentId, limit=200)
+        return FeedResponse(posts=posts)
+
+    except Exception as e:
+        logger.error(f"[API] Error retrieving feed for agentId={agentId}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# COMPATIBILITY & MONITORING ENDPOINTS
+# ============================================================================
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint with detailed status."""
-    db_ok = await db.ping()
+    """Health check endpoint with system status."""
     return {
-        "status": "healthy" if db_ok else "degraded",
-        "database": "connected" if db_ok else "disconnected",
+        "status": "healthy",
         "scheduler_running": scheduler.running,
-        "tier": tier_manager.tier if tier_manager else "unknown",
-        "version": "1.3.2"
+        "total_posts": memory_store.count_posts(),
+        "registered_agents": len(memory_store.list_agents()),
+        "version": "2.0.0"
     }
 
 
 @app.get("/metrics")
 async def metrics():
-    """Get bot metrics and statistics."""
+    """Metrics and statistics for evaluation monitoring."""
+    agents = memory_store.list_agents()
     return {
-        "posts_total": await db.count_posts(),
-        "posts_today": await db.count_posts_today(),
-        "mentions_total": await db.count_mentions(),
-        "mentions_today": await db.count_mentions_today(),
-        "last_post_at": await db.get_last_post_time(),
-        "last_mention_at": await db.get_last_mention_time()
+        "agents_count": len(agents),
+        "total_posts": memory_store.count_posts(),
+        "agents": agents
     }
 
 
-@app.get("/callback")
-async def oauth_callback(oauth_token: str = None, oauth_verifier: str = None):
-    """OAuth callback endpoint for Twitter authentication."""
-    return {
-        "status": "ok",
-        "message": "OAuth callback received",
-        "oauth_token": oauth_token,
-        "oauth_verifier": oauth_verifier
-    }
-
-
-@app.post("/webhook/mentions")
-async def handle_mentions_webhook(request: Request):
-    """
-    Handle incoming Twitter webhook for mentions.
-
-    Note: Webhook-based mentions require Enterprise tier.
-    For Basic/Pro tiers, use polling via /process-mentions endpoint.
-    """
-    if mention_handler is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
-    try:
-        data = await request.json()
-        logger.info(f"Received mention webhook: {data}")
-
-        # Webhook-based processing is not supported with agent architecture
-        # Use /process-mentions polling endpoint instead
-        logger.warning("[WEBHOOK] Webhook received but agent architecture uses polling. Use /process-mentions instead.")
-
-        return {
-            "status": "received",
-            "message": "Webhook received. Use /process-mentions for agent-based processing."
-        }
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/webhook/mentions")
-async def verify_webhook(crc_token: str = None):
-    """Handle Twitter CRC challenge for webhook verification."""
-    import hmac
-    import hashlib
-    import base64
-
-    if not crc_token:
-        raise HTTPException(status_code=400, detail="Missing crc_token")
-
-    sha256_hash = hmac.new(
-        settings.twitter_api_secret.encode(),
-        msg=crc_token.encode(),
-        digestmod=hashlib.sha256
-    ).digest()
-
-    response_token = base64.b64encode(sha256_hash).decode()
-
-    return {"response_token": f"sha256={response_token}"}
-
-
-@app.post("/trigger-post")
-async def trigger_post():
-    """
-    Trigger agent-based autopost (legacy mode).
-
-    The agent will:
-    1. Create a plan (which tools to use)
-    2. Execute tools step by step
-    3. Generate final post text
-    4. Post to Twitter
-    """
-    if autopost_service is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
-    try:
-        logger.info("=" * 60)
-        logger.info("ENDPOINT: /trigger-post called")
-        logger.info("=" * 60)
-
-        result = await autopost_service.run()
-
-        logger.info(f"ENDPOINT: Agent result: success={result.get('success')}")
-
-        return result
-
-    except Exception as e:
-        logger.error(f"ENDPOINT: Error in post: {e}")
-        logger.exception(e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/trigger-agent")
-async def trigger_agent():
-    """
-    Trigger unified agent cycle.
-
-    The agent will:
-    1. Load context (recent actions, rate limits)
-    2. Use tools to decide what to do (post, reply, search, etc.)
-    3. Execute actions until calling finish_cycle
-    """
-    if unified_agent is None:
-        raise HTTPException(status_code=503, detail="Unified agent not initialized")
-
-    try:
-        logger.info("=" * 60)
-        logger.info("ENDPOINT: /trigger-agent called")
-        logger.info("=" * 60)
-
-        result = await unified_agent.run()
-
-        logger.info(f"ENDPOINT: Unified agent result: {result}")
-
-        return result
-
-    except Exception as e:
-        logger.error(f"ENDPOINT: Error in unified agent: {e}")
-        logger.exception(e)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/check-mentions")
-async def check_mentions():
-    """Fetch mentions WITHOUT processing (dry run)."""
-    if mention_handler is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
-    try:
-        result = await mention_handler.check_mentions(dry_run=True)
-        return result
-    except Exception as e:
-        logger.error(f"Error checking mentions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/process-mentions")
-async def process_mentions():
-    """Fetch AND process mentions (actually reply)."""
-    if mention_handler is None:
-        raise HTTPException(status_code=503, detail="Service not initialized")
-
-    try:
-        result = await mention_handler.check_mentions(dry_run=False)
-        return result
-    except Exception as e:
-        logger.error(f"Error processing mentions: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/tier-status")
-async def get_tier_status():
-    """Get current Twitter API tier status and usage."""
-    if tier_manager is None:
-        raise HTTPException(status_code=503, detail="Tier manager not initialized")
-
-    return tier_manager.get_status()
-
-
-@app.post("/tier-refresh")
-async def refresh_tier():
-    """Force refresh tier detection."""
-    if tier_manager is None:
-        raise HTTPException(status_code=503, detail="Tier manager not initialized")
-
-    try:
-        result = await tier_manager.detect_tier()
-        return result
-    except Exception as e:
-        logger.error(f"Error refreshing tier: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/api/agent/cycle")
+async def trigger_agent_cycle(agentId: str = Query(..., description="Agent ID to trigger immediately")):
+    """Manual cycle trigger endpoint for testing or simulated fast-forwarding."""
+    result = await publisher_service.run_publishing_cycle(agentId)
+    return result
 
 
 if __name__ == "__main__":
