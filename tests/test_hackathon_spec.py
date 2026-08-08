@@ -1051,6 +1051,11 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         # 7. Centralized API Base URL Configuration
         self.assertEqual(settings.api_base_url, "https://echomind-ltwo.onrender.com")
 
+    def test_expected_x_handle_environment_configuration(self):
+        """Verify that EXPECTED_X_HANDLE is loaded without exposing raw secret values."""
+        self.assertTrue(bool(settings.x_expected_handle), "EXPECTED_X_HANDLE must be non-empty when configured.")
+        self.assertTrue(isinstance(settings.x_expected_handle, str))
+
     # =========================================================================
     # 13. LLM CLIENT STRUCTURED GENERATION CONTRACT TEST
     # =========================================================================

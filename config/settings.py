@@ -12,7 +12,11 @@ Loads configuration from environment variables and .env file with resilient defa
 """
 
 import os
+from dotenv import find_dotenv, load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Explicitly load .env into os.environ without overwriting process environment variables
+load_dotenv(find_dotenv() or ".env", override=False)
 
 
 class Settings(BaseSettings):
