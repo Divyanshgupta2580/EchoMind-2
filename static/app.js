@@ -411,17 +411,50 @@ function formatSourceUrl(url) {
   }
 }
 
-function formatDate(isoString) {
+// Centralized IST Timezone Formatters (Asia/Kolkata / UTC+05:30)
+const IST_TIME_FORMATTER = new Intl.DateTimeFormat("en-IN", {
+  timeZone: "Asia/Kolkata",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false
+});
+
+const IST_DATETIME_FORMATTER = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Kolkata",
+  year: "numeric",
+  month: "short",
+  day: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: true
+});
+
+function formatISTTime(isoString) {
   if (!isoString) return "None";
   try {
     const d = new Date(isoString);
-    const hours = String(d.getUTCHours()).padStart(2, "0");
-    const mins = String(d.getUTCMinutes()).padStart(2, "0");
-    const secs = String(d.getUTCSeconds()).padStart(2, "0");
-    return `${hours}:${mins}:${secs} UTC`;
+    if (isNaN(d.getTime())) return isoString;
+    return `${IST_TIME_FORMATTER.format(d)} IST`;
   } catch {
     return isoString;
   }
+}
+
+function formatISTDateTime(isoString) {
+  if (!isoString) return "None";
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return isoString;
+    return `${IST_DATETIME_FORMATTER.format(d)} IST`;
+  } catch {
+    return isoString;
+  }
+}
+
+function formatDate(isoString) {
+  return formatISTTime(isoString);
 }
 
 function escapeHtml(str) {
