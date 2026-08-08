@@ -1,6 +1,6 @@
-# API Keys and Configuration Guide
+# API Keys and Configuration Guide: EchoMind News Publisher
 
-This guide explains how to configure API keys for running the Autonomous AI & Technology Persona.
+This guide explains how to configure API keys for running the EchoMind autonomous news publisher.
 
 ---
 
@@ -19,25 +19,26 @@ OpenRouter provides access to frontier LLMs and real-time live web search plugin
 
 ---
 
-## 2. Persistent Storage Configuration
+## 2. Official X / Twitter API Credentials (Required for X Publishing)
 
-The system uses SQLite with WAL mode by default.
-
-```bash
-# Optional: Set custom path for SQLite database
-AGENT_DB_PATH=/data/agent_memory.db
-```
+To publish verified news stories to X/Twitter at the end of each 2-hour window:
+1. Go to [developer.x.com](https://developer.x.com)
+2. Create a project and developer app with **Read and Write** permissions.
+3. Configure your environment variables:
+   ```bash
+   X_API_KEY=your-consumer-api-key
+   X_API_SECRET=your-consumer-api-secret
+   X_ACCESS_TOKEN=your-access-token
+   X_ACCESS_TOKEN_SECRET=your-access-token-secret
+   X_BEARER_TOKEN=your-bearer-token
+   ```
 
 ---
 
-## 3. Optional / Legacy Twitter Integration
+## 3. Storage Configuration (SQLite WAL Mode)
 
-> [!NOTE]
-> Twitter API integration is legacy/out of scope for the AI Autonomy Hackathon specification. The autonomous persona operates completely independently via the Evaluator API (`/api/agent/init` and `/api/agent/feed`).
+The system uses embedded SQLite with Write-Ahead Logging (WAL) mode, storing all data in the local application filesystem:
 
-If running legacy Twitter posting mode:
-- `TWITTER_API_KEY`: Consumer API Key
-- `TWITTER_API_SECRET`: Consumer API Secret
-- `TWITTER_ACCESS_TOKEN`: User Access Token
-- `TWITTER_ACCESS_SECRET`: User Access Secret
-- `TWITTER_BEARER_TOKEN`: Application Bearer Token
+```bash
+AGENT_DB_PATH=./agent_memory.db
+```

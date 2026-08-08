@@ -1,43 +1,46 @@
-# Deploying to a VPS: Autonomous AI & Technology Persona
+# Deploying to a VPS: EchoMind Autonomous News Publisher
 
-This guide covers deploying the Autonomous AI Persona application on any Linux VPS (Ubuntu/Debian, CentOS, etc.) using Docker or systemd.
+This guide covers deploying the EchoMind autonomous news publisher on any Linux VPS using Docker or direct Python.
 
 ---
 
 ## 1. System Requirements
-- Linux VPS (1 vCPU, 1 GB RAM minimum)
-- Docker & Docker Compose (or Python 3.11+)
-- OpenRouter API Key
+- Linux VPS (1 vCPU, 512 MB - 1 GB RAM)
+- Python 3.11+ (or Docker)
+- OpenRouter API Key & X API Keys
 
 ---
 
-## 2. Docker Deployment (Recommended)
+## 2. Docker Deployment
 
 ### Step 1: Clone Repository
 ```bash
-git clone <repository_url> /opt/autonomous-ai-persona
-cd /opt/autonomous-ai-persona
+git clone <repository_url> /opt/echomind
+cd /opt/echomind
 ```
 
 ### Step 2: Configure Environment
-Create `/opt/autonomous-ai-persona/.env`:
+Create `/opt/echomind/.env`:
 ```bash
 OPENROUTER_API_KEY=sk-or-v1-...
-AGENT_DB_PATH=/data/agent_memory.db
+X_API_KEY=...
+X_API_SECRET=...
+X_ACCESS_TOKEN=...
+X_ACCESS_TOKEN_SECRET=...
+AGENT_DB_PATH=./agent_memory.db
 PORT=8080
 ```
 
 ### Step 3: Build & Run Container
 ```bash
-docker build -t autonomous-ai-persona .
+docker build -t echomind-news-publisher .
 
 docker run -d \
-  --name ai-persona \
+  --name echomind \
   --restart unless-stopped \
   -p 8080:8080 \
   --env-file .env \
-  -v persona-data:/data \
-  autonomous-ai-persona
+  echomind-news-publisher
 ```
 
 ---
@@ -45,11 +48,11 @@ docker run -d \
 ## 3. Verifying Evaluator Endpoints
 
 ```bash
-# 1. Initialize Persona
+# 1. Health Check
+curl http://localhost:8080/healthz
+
+# 2. Initialize Persona
 curl -X POST http://localhost:8080/api/agent/init \
   -H "Content-Type: application/json" \
   -d '{"persona": {"name": "Ada", "domain": "AI Security"}}'
-
-# 2. Query Reverse-Chronological Feed
-curl "http://localhost:8080/api/agent/feed?agentId=<agentId>"
 ```

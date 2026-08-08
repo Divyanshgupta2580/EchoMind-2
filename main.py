@@ -1,20 +1,27 @@
 """
-Autonomous AI & Technology Persona Service.
+Autonomous AI & Technology Persona News Publisher.
 
 FastAPI application providing:
+- Web Dashboard interface at / and /dashboard (connected to central API base URL)
 - POST /api/agent/init: Initialize autonomous persona with name & domain
 - GET /api/agent/feed: Fetch reverse-chronological feed with rationale and sources
-- Periodic background autonomous publishing via APScheduler
+- GET /api/agent/status: Real-time window, leader, candidate count, and publication status
+- GET /health and GET /healthz: Lightweight health check endpoints
+- 5-Minute continuous background discovery and 2-Hour publishing window scheduling via APScheduler
 """
 
 import asyncio
 import logging
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config.settings import settings
@@ -58,23 +65,47 @@ class FeedResponse(BaseModel):
     posts: list[FeedPostItem]
 
 
+class WindowStatus(BaseModel):
+    windowId: str | None = None
+    status: str
+    startedAt: str | None = None
+    endsAt: str | None = None
+    candidateCount: int = 0
+
+
+class LeaderStatus(BaseModel):
+    candidateId: str | None = None
+    title: str | None = None
+    score: float | None = None
+    summary: str | None = None
+
+
+class AgentStatusResponse(BaseModel):
+    agentId: str
+    window: WindowStatus
+    currentLeader: LeaderStatus | None = None
+    lastPublishedAt: str | None = None
+    lastPublicationStatus: str | None = None
+    nextWindow: str | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown with zero-failure guarantee."""
-    logger.info("[APP] Starting Autonomous AI Persona Service...")
+    logger.info("[APP] Starting Autonomous AI Persona News Publisher...")
 
     # Start the background task scheduler
     if not scheduler.running:
-        # Schedule periodic background publishing across all initialized agents every 2 minutes
-        # to ensure steady, reliable post generation during evaluation windows
+        # Schedule periodic background discovery and evaluation loop (every ~5 minutes)
+        # Governed by 2-hour publishing windows in AutonomousPublisherService
         scheduler.add_job(
             publisher_service.run_all_agents_cycle,
             "interval",
-            minutes=2,
+            minutes=settings.discovery_interval_minutes,
             id="autonomous_publishing_cycle"
         )
         scheduler.start()
-        logger.info("[APP] Background autonomous scheduler started successfully.")
+        logger.info(f"[APP] Background autonomous discovery scheduler started successfully (interval: {settings.discovery_interval_minutes} min, window: {settings.publish_window_minutes} min).")
 
     yield
 
@@ -86,11 +117,35 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Autonomous AI & Technology Persona API",
-    description="Hackathon API for autonomous topic discovery, editorial judgment, and feed publishing",
-    version="2.0.0",
+    title="Autonomous AI & Technology Persona News Publisher",
+    description="Quality-driven autonomous news publisher with 5-minute discovery loops and 2-hour publishing windows",
+    version="3.0.0",
     lifespan=lifespan
 )
+
+# Enable CORS for browser frontend clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static web frontend assets
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/dashboard", include_in_schema=False)
+async def serve_dashboard():
+    """Serve the web dashboard interface."""
+    index_file = static_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    return {"message": "EchoMind Autonomous Newsroom Backend", "status": "healthy"}
 
 
 # ============================================================================
@@ -103,8 +158,8 @@ async def init_agent(payload: AgentInitRequest):
     Initialize an autonomous persona with a name and technology domain.
     Called EXACTLY ONCE per agent.
 
-    Generates a unique agentId, registers the persona in memory, triggers
-    the first autonomous publishing cycle immediately, and schedules ongoing cycles.
+    Generates a unique agentId, registers the persona in memory, creates the initial
+    2-hour publishing window, and triggers the first discovery cycle immediately.
     """
     try:
         persona_name = payload.persona.name.strip()
@@ -119,9 +174,10 @@ async def init_agent(payload: AgentInitRequest):
         # Register in memory store
         memory_store.register_agent(agent_id, persona_name, persona_domain)
 
-        # Trigger ONE immediate publishing cycle so feed has fresh content upon initialization.
-        # Recurring autonomous cycles are handled by the single authoritative global scheduler job (`autonomous_publishing_cycle`),
-        # which automatically discovers all registered agents from SQLite via memory_store.list_agents().
+        # Create initial 2-hour publishing window
+        memory_store.create_window(agent_id, duration_minutes=settings.publish_window_minutes)
+
+        # Trigger ONE initial discovery cycle immediately to populate candidates
         asyncio.create_task(publisher_service.run_publishing_cycle(agent_id))
 
         logger.info(f"[API] Initialized agent '{persona_name}' in domain '{persona_domain}' with id={agent_id}")
@@ -160,19 +216,84 @@ async def get_agent_feed(agentId: str = Query(..., description="The unique agent
         raise HTTPException(status_code=500, detail="Internal server error retrieving feed.")
 
 
+@app.get("/api/agent/status", response_model=AgentStatusResponse, status_code=200)
+async def get_agent_status(agentId: str = Query(..., description="The unique agent identifier")):
+    """
+    Get the real-time status of an agent including current window, candidate count,
+    current leader story, and last publication status.
+    """
+    try:
+        if not agentId or not agentId.strip():
+            raise HTTPException(status_code=400, detail="agentId is required.")
+
+        clean_id = agentId.strip()
+        agent = memory_store.get_agent(clean_id)
+        if not agent:
+            raise HTTPException(status_code=404, detail=f"Agent {clean_id} not found.")
+
+        # Get active or latest window
+        window = memory_store.get_active_window(clean_id) or memory_store.get_latest_window(clean_id)
+        if not window:
+            window = memory_store.create_window(clean_id, duration_minutes=settings.publish_window_minutes)
+
+        window_id = window["window_id"]
+        candidates = memory_store.get_candidates_for_window(window_id)
+        candidate_count = len(candidates)
+        leader = memory_store.get_current_leader(window_id, min_score=settings.min_news_score)
+
+        # Get latest feed post
+        feed = memory_store.get_feed(clean_id, limit=1)
+        last_post_time = feed[0]["createdAt"] if feed else None
+
+        leader_status = None
+        if leader:
+            leader_status = LeaderStatus(
+                candidateId=leader["candidate_id"],
+                title=leader["title"],
+                score=leader["score"],
+                summary=leader.get("summary")
+            )
+
+        return AgentStatusResponse(
+            agentId=clean_id,
+            window=WindowStatus(
+                windowId=window["window_id"],
+                status=window["status"],
+                startedAt=window["started_at"],
+                endsAt=window["ends_at"],
+                candidateCount=candidate_count
+            ),
+            currentLeader=leader_status,
+            lastPublishedAt=last_post_time,
+            lastPublicationStatus=window.get("status", "OPEN"),
+            nextWindow=window["ends_at"]
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] Error retrieving status for agentId={agentId}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error retrieving status.")
+
+
 # ============================================================================
 # COMPATIBILITY & MONITORING ENDPOINTS
 # ============================================================================
 
 @app.get("/health")
+@app.get("/healthz")
 async def health_check():
-    """Health check endpoint with system status."""
+    """Lightweight health check endpoint with system status."""
     return {
         "status": "healthy",
         "scheduler_running": scheduler.running,
         "total_posts": memory_store.count_posts(),
         "registered_agents": len(memory_store.list_agents()),
-        "version": "2.0.0"
+        "discovery_interval_minutes": settings.discovery_interval_minutes,
+        "publish_window_minutes": settings.publish_window_minutes,
+        "min_news_score": settings.min_news_score,
+        "api_base_url": settings.api_base_url,
+        "version": "3.0.0"
     }
 
 
@@ -190,7 +311,17 @@ async def metrics():
 @app.post("/api/agent/cycle")
 async def trigger_agent_cycle(agentId: str = Query(..., description="Agent ID to trigger immediately")):
     """Manual cycle trigger endpoint for testing or simulated fast-forwarding."""
-    result = await publisher_service.run_publishing_cycle(agentId)
+    result = await publisher_service.run_discovery_and_evaluation_cycle(agentId)
+    return result
+
+
+@app.post("/api/agent/close-window")
+async def trigger_window_close(
+    agentId: str = Query(..., description="Agent ID"),
+    windowId: str = Query(..., description="Window ID to close and evaluate")
+):
+    """Manual window close trigger endpoint for testing 2-hour window evaluation."""
+    result = await publisher_service.process_window_close(agentId, windowId)
     return result
 
 

@@ -158,9 +158,7 @@
 ## 13. Persistence
 - **Status:** **VERIFIED (SQLite engine) / CONDITIONAL (Container volume mount)**
 - **Database Engine:** SQLite 3 with WAL Journaling
-- **Default Database Path:** `/Users/apple/Desktop/dot-automation/agent_memory.db`
-- **Reboot Test:** Database connection closed and reopened against the same file; all 3 posts and 4 editorial rejection records remained 100% intact.
-- **Deployment Requirement:** On container platforms, map `AGENT_DB_PATH` to a mounted persistent volume (`/data/agent_memory.db`).
+- **Deployment Requirement:** Uses local SQLite WAL database (`AGENT_DB_PATH=./agent_memory.db`) on Render Free Web Service instances without persistent disks.
 
 ---
 

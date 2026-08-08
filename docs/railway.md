@@ -1,12 +1,13 @@
-# Deploying to Railway: Autonomous AI & Technology Persona
+# Deploying to Railway: EchoMind Autonomous News Publisher
 
-This guide covers deploying the Autonomous AI Persona application to Railway with volume persistence.
+This guide covers deploying the EchoMind autonomous news publisher on Railway using the local filesystem SQLite store.
 
 ---
 
 ## 1. Prerequisites
 - Railway account ([railway.app](https://railway.app))
 - OpenRouter API key ([openrouter.ai](https://openrouter.ai))
+- Official X / Twitter API keys ([developer.x.com](https://developer.x.com))
 
 ---
 
@@ -20,27 +21,26 @@ This guide covers deploying the Autonomous AI Persona application to Railway wit
 ### Step 2: Configure Environment Variables
 In the **Variables** tab, configure:
 
-| Variable | Value / Description |
-| :--- | :--- |
-| `OPENROUTER_API_KEY` | `sk-or-v1-...` |
-| `AGENT_DB_PATH` | `/data/agent_memory.db` |
-| `PORT` | `8080` (Railway injects `$PORT` automatically) |
-
-### Step 3: Add Persistent Volume
-1. In the service settings, add a **Volume**.
-2. Mount Path: `/data`.
+| Variable | Value / Description | Required? |
+| :--- | :--- | :--- |
+| `OPENROUTER_API_KEY` | `sk-or-v1-...` | **Yes** (live LLM & search) |
+| `X_API_KEY` | Your X API Consumer Key | **Yes** (X publishing) |
+| `X_API_SECRET` | Your X API Consumer Secret | **Yes** (X publishing) |
+| `X_ACCESS_TOKEN` | Your X API Access Token | **Yes** (X publishing) |
+| `X_ACCESS_TOKEN_SECRET` | Your X API Access Token Secret | **Yes** (X publishing) |
+| `AGENT_DB_PATH` | `./agent_memory.db` | **Yes** (local SQLite database) |
+| `PORT` | `8080` (Railway injects `$PORT` automatically) | Auto |
 
 ---
 
 ## 3. Verifying the Deployment
 
-Test the evaluator endpoints:
 ```bash
-# 1. Initialize Persona
+# 1. Health Check
+curl https://your-railway-app.up.railway.app/healthz
+
+# 2. Initialize Persona
 curl -X POST https://your-railway-app.up.railway.app/api/agent/init \
   -H "Content-Type: application/json" \
   -d '{"persona": {"name": "Ada", "domain": "AI Security"}}'
-
-# 2. Query Feed
-curl "https://your-railway-app.up.railway.app/api/agent/feed?agentId=<agentId>"
 ```

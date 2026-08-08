@@ -6,27 +6,27 @@ This guide covers deploying the Autonomous AI Persona application to Docker, Rai
 
 ## 1. System Requirements
 - Python 3.11+ (or Docker)
-- Persistent volume storage (for `agent_memory.db`)
+- Local filesystem SQLite storage (`./agent_memory.db`)
 - OpenRouter API key (`OPENROUTER_API_KEY`) for live LLM completions and live web search.
+- Official X / Twitter API keys for news publishing.
 
 ---
 
-## 2. Docker Deployment (Recommended)
+## 2. Docker / Container Deployment
 
 ### Build the Image:
 ```bash
-docker build -t autonomous-ai-persona .
+docker build -t echomind-news-publisher .
 ```
 
-### Run with Persistent Volume:
+### Run Container:
 ```bash
 docker run -d \
-  --name ai-persona \
+  --name echomind \
   -p 8080:8080 \
   -e OPENROUTER_API_KEY="sk-or-v1-..." \
-  -e AGENT_DB_PATH="/data/agent_memory.db" \
-  -v persona-data:/data \
-  autonomous-ai-persona
+  -e AGENT_DB_PATH="./agent_memory.db" \
+  echomind-news-publisher
 ```
 
 ---

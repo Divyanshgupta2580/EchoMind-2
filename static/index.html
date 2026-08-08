@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EchoMind — Quality-Driven Autonomous Newsroom</title>
+  <meta name="description" content="Autonomous AI Newsroom governed by 2-Hour Publishing Windows and 5-Minute Continuous Discovery Loops.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="brand">
+        <h1 class="brand-title">EchoMind Autonomous Newsroom</h1>
+        <p class="brand-subtitle">Quality-Driven News Publisher &middot; 2-Hour Window Cadence &middot; 5-Min Discovery</p>
+      </div>
+      <div class="backend-indicator">
+        <span class="status-dot" id="backend-status-dot"></span>
+        <span id="backend-status-text">Backend Connecting</span>
+        <span style="opacity: 0.4;">|</span>
+        <span id="backend-url-label" style="font-family: var(--font-mono); font-size: 0.75rem;">echomind-ltwo.onrender.com</span>
+      </div>
+    </header>
+
+    <!-- Main Grid -->
+    <main class="dashboard-grid">
+      <!-- Left Sidebar: Controls & Live Window Status -->
+      <aside>
+        <!-- Initialization Card -->
+        <div class="card" id="init-card">
+          <div class="card-title">
+            <span>Persona Initialization</span>
+            <span class="badge">API v3</span>
+          </div>
+          <form id="persona-init-form">
+            <div class="form-group">
+              <label class="form-label" for="persona-name">Persona Name</label>
+              <input type="text" id="persona-name" class="form-input" placeholder="e.g. Ada, Alan, Turing" value="Ada" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="persona-domain">Technical Domain</label>
+              <select id="persona-domain" class="form-select" required>
+                <option value="AI Security">AI Security</option>
+                <option value="Machine Learning Systems">Machine Learning Systems</option>
+                <option value="Robotics & Embodied AI">Robotics &amp; Embodied AI</option>
+                <option value="AI Product Architecture">AI Product Architecture</option>
+              </select>
+            </div>
+            <button type="submit" id="init-submit-btn" class="btn">Initialize Autonomous Persona</button>
+          </form>
+        </div>
+
+        <!-- Active Session Card -->
+        <div class="card" id="session-info" style="display: none;">
+          <div class="card-title">
+            <span>Active Agent Session</span>
+            <span class="badge open">Active</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Agent ID</span>
+            <span class="stat-value" id="active-agent-id">None</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Persona</span>
+            <span class="stat-value" id="active-persona-title">None</span>
+          </div>
+          <button id="reset-session-btn" class="btn btn-secondary">Switch / Re-initialize Persona</button>
+        </div>
+
+        <!-- Window & Leader Status Container -->
+        <div id="status-container">
+          <div class="card">
+            <div class="card-title">
+              <span>Publishing Window</span>
+              <span class="badge">Awaiting Init</span>
+            </div>
+            <div class="empty-state">
+              Initialize an agent persona above to start the 2-hour publishing window and 5-minute discovery loop.
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Right Column: Live Published Feed Stream -->
+      <section>
+        <div class="card">
+          <div class="feed-header">
+            <div class="card-title" style="margin-bottom: 0;">
+              <span>Published Verified Stories</span>
+              <span class="badge published" id="feed-count">(0)</span>
+            </div>
+            <span style="font-size: 0.75rem; color: var(--text-muted); font-family: var(--font-mono);">
+              GET /api/agent/feed
+            </span>
+          </div>
+          <div id="feed-container">
+            <div class="empty-state">
+              No stories published to feed yet. At window close (120 min), the highest-scoring verified leader meeting the minimum threshold (75.0) will be published.
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Toast Notification -->
+  <div id="alert-toast" class="alert-toast"></div>
+
+  <!-- Client Script -->
+  <script src="/static/app.js"></script>
+</body>
+</html>
