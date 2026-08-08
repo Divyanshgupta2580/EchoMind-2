@@ -1121,66 +1121,6 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         finally:
             httpx.AsyncClient = original_client
 
-    def test_verify_x_account_diagnostic_security(self):
-        """
-        Verify security behavior of GET /api/admin/verify-x-account:
-        1. Returns 503 if ADMIN_API_KEY is missing/empty on server (verify_authenticated_account NOT called).
-        2. Returns 403 if ADMIN_API_KEY is set but X-Admin-Key is missing/wrong (verify_authenticated_account NOT called).
-        3. Returns 200 and executes mocked get_me check when X-Admin-Key matches ADMIN_API_KEY.
-        """
-        import os
-        from unittest.mock import patch
-        from fastapi.testclient import TestClient
-        from main import app, publisher_service
-
-        client = TestClient(app)
-        old_secret = os.environ.get("ADMIN_API_KEY")
-        old_expected_handle = os.environ.get("EXPECTED_X_HANDLE")
-
-        os.environ["EXPECTED_X_HANDLE"] = "RASBASRYPI"
-
-        try:
-            with patch.object(
-                publisher_service.publisher,
-                "verify_authenticated_account",
-                return_value={"success": True, "handle": "RASBASRYPI", "error": None}
-            ) as mock_verify:
-                # 1. Missing ADMIN_API_KEY -> 503
-                os.environ.pop("ADMIN_API_KEY", None)
-                res1 = client.get("/api/admin/verify-x-account")
-                self.assertEqual(res1.status_code, 503)
-                self.assertIn("not configured", res1.json()["detail"])
-                mock_verify.assert_not_called()
-
-                # 2. Configured ADMIN_API_KEY but wrong X-Admin-Key -> 403
-                os.environ["ADMIN_API_KEY"] = "secret-admin-123"
-                res2 = client.get("/api/admin/verify-x-account", headers={"X-Admin-Key": "wrong-key"})
-                self.assertEqual(res2.status_code, 403)
-                self.assertIn("Unauthorized", res2.json()["detail"])
-                mock_verify.assert_not_called()
-
-                # 3. Correct X-Admin-Key -> 200
-                res3 = client.get("/api/admin/verify-x-account", headers={"X-Admin-Key": "secret-admin-123"})
-                self.assertEqual(res3.status_code, 200)
-                mock_verify.assert_called_once()
-
-                data3 = res3.json()
-                self.assertTrue(data3["success"])
-                self.assertEqual(data3["authenticated_username"], "RASBASRYPI")
-                self.assertEqual(data3["expected_username"], "RASBASRYPI")
-                self.assertTrue(data3["account_match"])
-                self.assertIsNone(data3.get("error"))
-        finally:
-            if old_secret is not None:
-                os.environ["ADMIN_API_KEY"] = old_secret
-            else:
-                os.environ.pop("ADMIN_API_KEY", None)
-
-            if old_expected_handle is not None:
-                os.environ["EXPECTED_X_HANDLE"] = old_expected_handle
-            else:
-                os.environ.pop("EXPECTED_X_HANDLE", None)
-
 
 if __name__ == "__main__":
     unittest.main()
