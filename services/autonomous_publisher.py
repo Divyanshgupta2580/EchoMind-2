@@ -8,15 +8,20 @@ Orchestrates the 5-minute continuous discovery loop and the 2-hour quality-drive
    - Persists all candidates, scores, and rejection decisions to SQLite.
    - Dynamically tracks and updates the window's top-scoring leader.
 2. At the end of every 2-hour window (or when window ends_at <= now):
+   - Atomically claims the window via SQLite CAS lock (OPEN -> SELECTING).
    - Compares all eligible candidates in the window.
    - Selects the highest-quality leader.
    - Verifies the leader meets MIN_NEWS_SCORE (default: 75.0).
    - If qualified: publishes exactly ONE post to X/Twitter via IXPublisher and records it to feed.
    - If no candidate meets threshold: publishes NOTHING (status: NO_QUALIFIED_STORY).
    - Closes the window and opens the next 2-hour window.
+3. Thread-safe & Concurrency Protected:
+   - Uses per-agent asyncio.Lock to prevent overlapping discovery cycles.
+   - Uses SQLite atomic CAS transitions to prevent duplicate publications.
 """
 
 import asyncio
+import hashlib
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -37,6 +42,7 @@ logger = logging.getLogger(__name__)
 class AutonomousPublisherService:
     """
     Quality-driven autonomous publishing orchestrator.
+    Guarantees: ONE 2-HOUR WINDOW = AT MOST ONE X POST.
     """
 
     def __init__(
@@ -49,21 +55,38 @@ class AutonomousPublisherService:
         self.llm = llm or LLMClient()
         self.discovery = TopicDiscoveryService(self.llm)
         self.editorial = EditorialEngine(self.llm, self.memory)
+        self._agent_locks: dict[str, asyncio.Lock] = {}
         
-        # Configure X publisher; default to XPublisher, fallback to MockXPublisher if credentials unset
+        # Configure X publisher; default to XPublisher with memory_store, fallback to MockXPublisher if credentials unset
         if publisher is not None:
             self.publisher = publisher
         elif settings.x_api_key and settings.x_api_secret and settings.x_access_token and settings.x_access_token_secret:
-            self.publisher = XPublisher()
+            self.publisher = XPublisher(memory_store=self.memory)
         else:
             logger.info("[PUBLISHER] X credentials not detected; using MockXPublisher for safe execution.")
             self.publisher = MockXPublisher()
 
+    def _get_agent_lock(self, agent_id: str) -> asyncio.Lock:
+        """Get or create an asyncio.Lock for a specific agent to prevent cycle overlap."""
+        if agent_id not in self._agent_locks:
+            self._agent_locks[agent_id] = asyncio.Lock()
+        return self._agent_locks[agent_id]
+
     async def run_discovery_and_evaluation_cycle(self, agent_id: str) -> dict[str, Any]:
         """
         Execute one 5-minute discovery and evaluation cycle for an agent.
-        Does NOT blindly publish; evaluates candidates, updates leader, and checks window status.
+        Guarantees that cycles for the same agent never overlap concurrently.
         """
+        lock = self._get_agent_lock(agent_id)
+        if lock.locked():
+            logger.warning(f"[PUBLISHER] Discovery cycle already in progress for agent {agent_id}; skipping overlapping execution.")
+            return {"success": False, "action": "skipped_overlap", "agent_id": agent_id}
+
+        async with lock:
+            return await self._run_discovery_internal(agent_id)
+
+    async def _run_discovery_internal(self, agent_id: str) -> dict[str, Any]:
+        """Internal worker for 5-minute discovery and window evaluation."""
         agent = self.memory.get_agent(agent_id)
         if not agent:
             logger.error(f"[PUBLISHER] Agent {agent_id} not found in memory store.")
@@ -78,7 +101,7 @@ class AutonomousPublisherService:
 
         # Step 2: Check if current window duration has elapsed
         if window["ends_at"] <= now_utc:
-            logger.info(f"[WINDOW] Window {window_id} has reached ends_at time. Executing window close evaluation...")
+            logger.info(f"[WINDOW] Window {window_id} has reached ends_at time ({window['ends_at']}). Executing atomic window close evaluation...")
             return await self.process_window_close(agent_id, window_id)
 
         # Step 3: Run 5-minute candidate discovery
@@ -145,19 +168,48 @@ class AutonomousPublisherService:
 
     async def process_window_close(self, agent_id: str, window_id: str) -> dict[str, Any]:
         """
-        Execute window close evaluation at the end of the 2-hour publishing window:
-        - Selects the highest quality candidate.
-        - Publishes exactly ONE post if candidate meets MIN_NEWS_SCORE.
-        - Publishes NOTHING if no candidate qualifies.
-        - Closes the window and opens the next 2-hour window.
+        CRIT-001 & CRIT-002: Execute idempotent, race-free window close evaluation:
+        1. Verifies that the target window exists and is in 'OPEN' status.
+        2. Atomically claims the window (OPEN -> SELECTING) in SQLite before calling external APIs.
+        3. If rowcount == 0, another execution claimed or closed it; returns safely without side-effects.
+        4. Selects the highest quality eligible leader (score >= MIN_NEWS_SCORE).
+        5. If qualified: publishes exactly ONE post to X/Twitter and opens next 2-hour window.
+        6. If no qualified candidate: sets status to NO_QUALIFIED_STORY, publishes nothing, and opens next window.
         """
         agent = self.memory.get_agent(agent_id)
         if not agent:
             return {"success": False, "error": f"Agent {agent_id} not found"}
 
-        logger.info(f"[WINDOW] === Closing Window {window_id} for agent '{agent['name']}' ===")
+        # CRIT-002: Check existing window state
+        window = self.memory.get_window(window_id)
+        if not window:
+            logger.warning(f"[WINDOW] Window {window_id} not found.")
+            return {"success": False, "action": "ignored", "reason": f"Window {window_id} not found"}
+
+        if window["status"] != "OPEN":
+            logger.info(f"[WINDOW] Window {window_id} is already in status '{window['status']}'. Ignoring re-close attempt.")
+            return {
+                "success": False,
+                "action": "ignored",
+                "reason": f"Window is in state '{window['status']}' (must be OPEN)",
+                "window_id": window_id,
+                "current_status": window["status"]
+            }
+
+        # CRIT-001: Atomic SQLite CAS transition (OPEN -> SELECTING)
+        claimed = self.memory.claim_window_for_closing(window_id)
+        if not claimed:
+            logger.warning(f"[WINDOW] Concurrent attempt to close window {window_id} blocked by atomic CAS lock.")
+            return {
+                "success": False,
+                "action": "ignored",
+                "reason": "Window already claimed by another execution thread",
+                "window_id": window_id
+            }
+
+        logger.info(f"[WINDOW] === Processing Window Close for {window_id} (Agent: '{agent['name']}') ===")
         profile = build_persona_profile(agent["name"], agent["domain"])
-        
+
         # Retrieve best eligible leader in window
         leader = self.memory.get_current_leader(window_id, min_score=settings.min_news_score)
 
@@ -177,7 +229,10 @@ class AutonomousPublisherService:
         logger.info(f"[SELECTION] Selected winning candidate: '{leader['title']}' with score={leader['score']:.1f}")
         post_data = await self.editorial.synthesize_post_for_leader(agent_id, profile, leader)
 
-        # Publish to X/Twitter
+        # Generate deterministic idempotency key for this window publication
+        idempotency_key = f"{agent_id}-{window_id}-{leader['candidate_id']}"
+
+        # Publish to X/Twitter with bounded retries and idempotency
         logger.info(f"[X] Publishing post for window {window_id} ({len(post_data['text'])} chars)...")
         pub_result = await self.publisher.publish_post(
             text=post_data["text"],
@@ -185,7 +240,9 @@ class AutonomousPublisherService:
                 "window_id": window_id,
                 "candidate_id": leader["candidate_id"],
                 "topic_hash": post_data["topic_hash"],
-                "sources": post_data["sources"]
+                "sources": post_data["sources"],
+                "idempotency_key": idempotency_key,
+                "agent_id": agent_id
             }
         )
 
@@ -205,6 +262,13 @@ class AutonomousPublisherService:
                 status="PUBLISHED",
                 selected_candidate_id=leader["candidate_id"],
                 post_id=pub_result.get("post_id")
+            )
+            self.memory.save_x_publication_record(
+                idempotency_key=idempotency_key,
+                post_id=pub_result.get("post_id") or "pub-confirmed",
+                text=post_data["text"],
+                agent_id=agent_id,
+                window_id=window_id
             )
             logger.info(f"[X] Published successfully! Post ID: {pub_result.get('post_id')}")
 
@@ -242,6 +306,7 @@ class AutonomousPublisherService:
     async def run_all_agents_cycle(self) -> None:
         """
         Cycle through all registered agents and run continuous discovery & window checks.
+        Safe against slow jobs and sequential per agent.
         """
         agents = self.memory.list_agents()
         logger.info(f"[PUBLISHER] Running periodic 5-minute background cycle for {len(agents)} active agent(s)")

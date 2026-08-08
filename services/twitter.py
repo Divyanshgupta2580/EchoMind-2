@@ -4,9 +4,10 @@ Official X / Twitter Publishing Implementation.
 Provides:
 1. IXPublisher abstraction interface adherence.
 2. XPublisher: Tweepy API v2 integration with OAuth 1.0a / Bearer authentication,
-   idempotency tracking, 280-character validation, and bounded retry policy.
-3. MockXPublisher: In-memory mock publisher for automated testing and offline verification.
-4. TwitterClient: Backwards-compatible Tweepy client wrapper.
+   persistent SQLite idempotency tracking, 280-character validation, and bounded retry policy.
+3. Safe duplicate reconciliation: Distinguishes pre-ingestion network failure from post-ingestion
+   duplicate-content confirmations, preventing false FAILED classifications.
+4. MockXPublisher: In-memory mock publisher for automated testing and offline verification.
 """
 
 import asyncio
@@ -26,7 +27,7 @@ MAX_X_POST_LENGTH = 280
 class XPublisher(IXPublisher):
     """
     Production publisher for X/Twitter using official API v2 via Tweepy.
-    Implements character limit validation, idempotency, and bounded retries.
+    Implements character limit validation, persistent idempotency, and bounded retries.
     """
 
     def __init__(
@@ -36,7 +37,8 @@ class XPublisher(IXPublisher):
         access_token: str | None = None,
         access_token_secret: str | None = None,
         bearer_token: str | None = None,
-        max_retries: int = 3
+        max_retries: int = 3,
+        memory_store: Any | None = None
     ):
         self.api_key = api_key or settings.x_api_key
         self.api_secret = api_secret or settings.x_api_secret
@@ -44,6 +46,7 @@ class XPublisher(IXPublisher):
         self.access_token_secret = access_token_secret or settings.x_access_token_secret
         self.bearer_token = bearer_token or settings.x_bearer_token
         self.max_retries = max_retries
+        self.memory_store = memory_store
         self._published_idempotency_keys: dict[str, str] = {}
         self._client: Any = None
 
@@ -73,12 +76,12 @@ class XPublisher(IXPublisher):
         metadata: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """
-        Publish post to X with character validation, idempotency, and bounded retries.
+        Publish post to X with character validation, persistent idempotency, and safe retries.
         """
         metadata = metadata or {}
         trimmed_text = text.strip()
 
-        # 1. Character Limit Validation
+        # 1. Character Limit Validation (Must be <= 280 characters)
         if len(trimmed_text) > MAX_X_POST_LENGTH:
             logger.error(f"[X_PUBLISHER] Post exceeds {MAX_X_POST_LENGTH} characters ({len(trimmed_text)} chars).")
             return {
@@ -89,11 +92,13 @@ class XPublisher(IXPublisher):
                 "error": f"Character limit exceeded: {len(trimmed_text)} > {MAX_X_POST_LENGTH}"
             }
 
-        # 2. Idempotency Check
+        # 2. Idempotency Check (In-memory + Persistent SQLite)
         idempotency_key = metadata.get("idempotency_key") or hashlib.sha256(trimmed_text.encode("utf-8")).hexdigest()[:16]
+
+        # Check in-memory fast cache
         if idempotency_key in self._published_idempotency_keys:
             existing_post_id = self._published_idempotency_keys[idempotency_key]
-            logger.info(f"[X_PUBLISHER] Post already published (Idempotency Key: {idempotency_key} -> Post ID: {existing_post_id})")
+            logger.info(f"[X_PUBLISHER] Post already published (In-memory Idempotency: {idempotency_key} -> {existing_post_id})")
             return {
                 "success": True,
                 "status": "PUBLISHED",
@@ -103,7 +108,22 @@ class XPublisher(IXPublisher):
                 "is_duplicate": True
             }
 
-        # 3. Execution with Bounded Retries
+        # Check persistent SQLite store for restart durability
+        if self.memory_store and hasattr(self.memory_store, "get_x_publication_record"):
+            rec = self.memory_store.get_x_publication_record(idempotency_key)
+            if rec:
+                logger.info(f"[X_PUBLISHER] Post already recorded in persistent SQLite ({idempotency_key} -> {rec['post_id']})")
+                self._published_idempotency_keys[idempotency_key] = rec["post_id"]
+                return {
+                    "success": True,
+                    "status": "PUBLISHED",
+                    "post_id": rec["post_id"],
+                    "text": trimmed_text,
+                    "error": None,
+                    "is_duplicate": True
+                }
+
+        # 3. Execution with Bounded Retries and Duplicate Response Reconciliation
         last_error = None
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -115,6 +135,15 @@ class XPublisher(IXPublisher):
                 post_id = str(response.data["id"])
 
                 self._published_idempotency_keys[idempotency_key] = post_id
+                if self.memory_store and hasattr(self.memory_store, "save_x_publication_record"):
+                    self.memory_store.save_x_publication_record(
+                        idempotency_key=idempotency_key,
+                        post_id=post_id,
+                        text=trimmed_text,
+                        agent_id=metadata.get("agent_id", "unknown"),
+                        window_id=metadata.get("window_id", "unknown")
+                    )
+
                 logger.info(f"[X_PUBLISHER] Successfully published to X! Post ID: {post_id}")
                 return {
                     "success": True,
@@ -123,9 +152,37 @@ class XPublisher(IXPublisher):
                     "text": trimmed_text,
                     "error": None
                 }
+
             except Exception as e:
                 last_error = e
+                err_str = str(e).lower()
                 logger.warning(f"[X_PUBLISHER] Attempt {attempt} failed: {e}")
+
+                # HIGH-001 Reconciliation: If X reports duplicate content on a retry attempt,
+                # the tweet was successfully accepted by X during an earlier attempt where the HTTP response was lost.
+                is_duplicate_response = ("duplicate" in err_str or "403" in err_str or "already" in err_str)
+                if is_duplicate_response and attempt > 1:
+                    logger.warning(f"[X_PUBLISHER] X returned duplicate content response for {idempotency_key}. Reconciling as confirmed published.")
+                    recovered_post_id = self._published_idempotency_keys.get(idempotency_key) or f"x-confirmed-{idempotency_key[:8]}"
+                    self._published_idempotency_keys[idempotency_key] = recovered_post_id
+                    if self.memory_store and hasattr(self.memory_store, "save_x_publication_record"):
+                        self.memory_store.save_x_publication_record(
+                            idempotency_key=idempotency_key,
+                            post_id=recovered_post_id,
+                            text=trimmed_text,
+                            agent_id=metadata.get("agent_id", "unknown"),
+                            window_id=metadata.get("window_id", "unknown")
+                        )
+                    return {
+                        "success": True,
+                        "status": "PUBLISHED",
+                        "post_id": recovered_post_id,
+                        "text": trimmed_text,
+                        "error": None,
+                        "is_duplicate": True,
+                        "reconciled": True
+                    }
+
                 if attempt < self.max_retries:
                     await asyncio.sleep(2 ** attempt)
 
@@ -142,7 +199,7 @@ class XPublisher(IXPublisher):
 class MockXPublisher(IXPublisher):
     """
     In-memory mock publisher for automated tests and offline development.
-    Guarantees zero external network requests.
+    Guarantees zero external network requests and safe simulation.
     """
 
     def __init__(self, should_fail: bool = False):
@@ -167,16 +224,8 @@ class MockXPublisher(IXPublisher):
                 "error": f"Character limit exceeded: {len(trimmed_text)} > {MAX_X_POST_LENGTH}"
             }
 
-        if self.should_fail:
-            return {
-                "success": False,
-                "status": "FAILED",
-                "post_id": None,
-                "text": trimmed_text,
-                "error": "Simulated network timeout during X publish"
-            }
-
         idempotency_key = metadata.get("idempotency_key") or hashlib.sha256(trimmed_text.encode("utf-8")).hexdigest()[:16]
+
         if idempotency_key in self._idempotency_map:
             return {
                 "success": True,
@@ -187,30 +236,27 @@ class MockXPublisher(IXPublisher):
                 "is_duplicate": True
             }
 
-        mock_id = f"x-mock-{len(self.published_posts) + 1:04d}"
-        self._idempotency_map[idempotency_key] = mock_id
+        if self.should_fail:
+            return {
+                "success": False,
+                "status": "FAILED",
+                "post_id": None,
+                "text": trimmed_text,
+                "error": "Simulated mock network failure"
+            }
+
+        mock_post_id = f"x-mock-{len(self.published_posts) + 1:04d}"
+        self._idempotency_map[idempotency_key] = mock_post_id
         record = {
-            "success": True,
-            "status": "PUBLISHED",
-            "post_id": mock_id,
+            "post_id": mock_post_id,
             "text": trimmed_text,
-            "metadata": metadata,
-            "error": None
+            "metadata": metadata
         }
         self.published_posts.append(record)
-        logger.info(f"[MOCK_X] Simulated publish: {mock_id} -> '{trimmed_text[:50]}...'")
-        return record
-
-
-# Backwards compatibility wrapper
-class TwitterClient:
-    """Legacy Twitter client retained for backwards compatibility."""
-
-    def __init__(self):
-        self.publisher = XPublisher()
-
-    async def post(self, text: str, media_ids: list[str] | None = None) -> dict[str, Any]:
-        result = await self.publisher.publish_post(text)
-        if not result["success"]:
-            raise RuntimeError(result.get("error", "Failed to post"))
-        return {"id": result["post_id"], "text": text}
+        return {
+            "success": True,
+            "status": "PUBLISHED",
+            "post_id": mock_post_id,
+            "text": trimmed_text,
+            "error": None
+        }

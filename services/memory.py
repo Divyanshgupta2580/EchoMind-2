@@ -7,6 +7,7 @@ Provides thread-safe, resilient persistence using SQLite with WAL mode, storing:
 - Editorial Decisions (agent_id, topic_title, decision, reason, evaluated_at)
 - Publishing Windows (window_id, agent_id, started_at, ends_at, status, selected_candidate_id, published_at, post_id)
 - News Candidates (candidate_id, agent_id, window_id, title, summary, source_urls, source_quality, discovered_at, score, score_breakdown, status, rejection_reason, topic_hash)
+- X Publication Records for cross-restart idempotent posting deduplication
 - Topic Fingerprints / Hashes for deduplication
 """
 
@@ -101,7 +102,7 @@ class AgentMemoryStore:
                     agent_id TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     ends_at TEXT NOT NULL,
-                    status TEXT NOT NULL, -- OPEN, SELECTING, PUBLISHED, NO_QUALIFIED_STORY, EXPIRED
+                    status TEXT NOT NULL, -- OPEN, SELECTING, PUBLISHED, NO_QUALIFIED_STORY, EXPIRED, FAILED
                     selected_candidate_id TEXT,
                     published_at TEXT,
                     post_id TEXT,
@@ -130,6 +131,18 @@ class AgentMemoryStore:
                 )
             """)
 
+            # Persistent X publication records table for restart-safe idempotency
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS x_publication_records (
+                    idempotency_key TEXT PRIMARY KEY,
+                    post_id TEXT,
+                    text TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    window_id TEXT NOT NULL
+                )
+            """)
+
             # Create performance and uniqueness indexes
             conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_agent_time ON feed_posts(agent_id, created_at DESC);")
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_posts_agent_topic_hash ON feed_posts(agent_id, topic_hash);")
@@ -137,6 +150,7 @@ class AgentMemoryStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_windows_agent ON publishing_windows(agent_id, started_at DESC);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_window ON news_candidates(window_id, score DESC);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_candidates_agent_hash ON news_candidates(agent_id, topic_hash);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_x_pub_window ON x_publication_records(window_id);")
             conn.commit()
             logger.info(f"[MEMORY] Initialized SQLite store at {self.db_path}")
 
@@ -368,7 +382,7 @@ class AgentMemoryStore:
             ]
 
     # =========================================================================
-    # PUBLISHING WINDOWS (2-HOUR WINDOW MANAGEMENT)
+    # PUBLISHING WINDOWS (2-HOUR WINDOW MANAGEMENT & CAS LOCKS)
     # =========================================================================
 
     def create_window(self, agent_id: str, duration_minutes: int = 120) -> dict[str, Any]:
@@ -435,14 +449,37 @@ class AgentMemoryStore:
         if active:
             return active
 
-        # If previous window exists but expired without formal closure, close it as EXPIRED
+        # If previous window exists but expired without formal closure, return it so it can be evaluated
         latest = self.get_latest_window(agent_id)
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if latest and latest["status"] == "OPEN" and latest["ends_at"] <= now_utc:
-            # Let caller handle window close evaluation or mark EXPIRED
             return latest
 
         return self.create_window(agent_id, duration_minutes)
+
+    def claim_window_for_closing(self, window_id: str) -> bool:
+        """
+        CRIT-001 ATOMIC CAS LOCK:
+        Atomically transition window from 'OPEN' to 'SELECTING'.
+        Guarantees that exactly ONE execution thread can ever process and close a window.
+        Returns True if claimed, False if already claimed or closed.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE publishing_windows 
+                SET status = 'SELECTING' 
+                WHERE window_id = ? AND status = 'OPEN'
+                """,
+                (window_id,)
+            )
+            conn.commit()
+            claimed = (cursor.rowcount == 1)
+            if claimed:
+                logger.info(f"[WINDOW] Atomically claimed window {window_id} for closing (OPEN -> SELECTING)")
+            else:
+                logger.warning(f"[WINDOW] Claim rejected for window {window_id} (status is not OPEN or already claimed)")
+            return claimed
 
     def close_window(
         self,
@@ -496,6 +533,9 @@ class AgentMemoryStore:
             discovered_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         if not topic_hash:
             topic_hash = self.compute_topic_hash(title)
+
+        # Clamping score strictly within 0-100
+        score = min(100.0, max(0.0, float(score)))
 
         source_urls_json = json.dumps(source_urls if isinstance(source_urls, list) else [])
         score_breakdown_json = json.dumps(score_breakdown if isinstance(score_breakdown, dict) else {})
@@ -614,6 +654,40 @@ class AgentMemoryStore:
                 (agent_id, topic_hash)
             ).fetchone()
             return row is not None
+
+    # =========================================================================
+    # PERSISTENT X IDEMPOTENCY RECORDS
+    # =========================================================================
+
+    def save_x_publication_record(
+        self,
+        idempotency_key: str,
+        post_id: str,
+        text: str,
+        agent_id: str,
+        window_id: str
+    ) -> None:
+        """Persist X publication record for restart-durable duplicate prevention."""
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO x_publication_records 
+                (idempotency_key, post_id, text, published_at, agent_id, window_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (idempotency_key, post_id, text, now_utc, agent_id, window_id)
+            )
+            conn.commit()
+
+    def get_x_publication_record(self, idempotency_key: str) -> dict[str, Any] | None:
+        """Query persistent X publication record by idempotency key."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM x_publication_records WHERE idempotency_key = ?",
+                (idempotency_key,)
+            ).fetchone()
+            return dict(row) if row else None
 
 
 # Global persistent memory singleton

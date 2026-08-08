@@ -1,6 +1,7 @@
 /**
  * EchoMind Autonomous News Publisher — Frontend Client Layer
  * Centralized configuration communicating with the deployed backend.
+ * Resilient against Render Free cold starts and database re-initialization.
  */
 
 // ============================================================================
@@ -98,85 +99,85 @@ const apiClient = {
 // 4. UI RENDERERS & EVENT HANDLERS
 // ============================================================================
 function showToast(message, duration = 3000) {
-  const toast = document.getElementById("alert-toast");
-  if (!toast) return;
+  let toast = document.getElementById("app-toast");
+  if (!toast) {
+    toast = document.createElement("div");
+    toast.id = "app-toast";
+    toast.className = "app-toast";
+    document.body.appendChild(toast);
+  }
   toast.textContent = message;
-  toast.style.display = "block";
-  setTimeout(() => {
-    toast.style.display = "none";
-  }, duration);
+  toast.classList.add("visible");
+  setTimeout(() => toast.classList.remove("visible"), duration);
 }
 
-function updateBackendStatus(isHealthy, text = "") {
-  const dot = document.getElementById("backend-status-dot");
-  const label = document.getElementById("backend-status-text");
-  if (!dot || !label) return;
+function updateBackendStatus(healthy, message) {
+  STATE.backendHealthy = healthy;
+  const badge = document.getElementById("backend-status-badge");
+  const text = document.getElementById("backend-status-text");
+  if (!badge || !text) return;
 
-  if (isHealthy) {
-    dot.className = "status-dot healthy";
-    label.textContent = text || "Backend Live";
+  if (healthy) {
+    badge.className = "status-badge healthy";
+    text.textContent = message || "Backend Live";
   } else {
-    dot.className = "status-dot error";
-    label.textContent = text || "Backend Connecting";
+    badge.className = "status-badge connecting";
+    text.textContent = message || "Connecting...";
   }
 }
 
 function renderStatus() {
-  const container = document.getElementById("status-container");
+  const container = document.getElementById("window-status-container");
   if (!container || !STATE.statusData) return;
 
-  const { window: win, currentLeader, lastPublishedAt } = STATE.statusData;
-
-  const statusBadgeClass = 
-    win.status === "OPEN" ? "open" :
-    win.status === "PUBLISHED" ? "published" : "no-story";
+  const data = STATE.statusData;
+  const windowId = data.window ? data.window.windowId : "win-none";
+  const windowStatus = data.window ? data.window.status : "OPEN";
+  const candidateCount = data.window ? data.window.candidateCount : 0;
+  const endsAt = data.window && data.window.endsAt ? data.window.endsAt : null;
+  const leader = data.currentLeader;
+  const lastPublishedAt = data.lastPublishedAt;
 
   let leaderHtml = `
-    <div class="empty-state">
-      Candidate evaluation in progress. Searching for stories meeting minimum quality threshold (75.0).
+    <div class="leader-box empty">
+      <div class="leader-label">Current Window Leader (Score >= 75)</div>
+      <div class="leader-desc">No qualified candidate yet. Discovery loop executes every 5 minutes.</div>
     </div>
   `;
 
-  if (currentLeader && currentLeader.title) {
+  if (leader) {
     leaderHtml = `
-      <div class="card leader-card">
-        <div class="card-title">
-          <span>Current Window Leader</span>
-          <span class="badge open">Score: ${Number(currentLeader.score).toFixed(1)}/100</span>
+      <div class="leader-box active">
+        <div class="leader-header">
+          <span class="leader-badge">Top Candidate</span>
+          <span class="leader-score">${Number(leader.score).toFixed(1)} / 100</span>
         </div>
-        <div class="leader-score">
-          ${Number(currentLeader.score).toFixed(1)} <span class="leader-score-max">/ 100</span>
-        </div>
-        <div class="leader-title">${escapeHtml(currentLeader.title)}</div>
-        <div class="leader-summary">${escapeHtml(currentLeader.summary || "")}</div>
+        <div class="leader-title">${escapeHtml(leader.title)}</div>
+        <div class="leader-desc">${escapeHtml(leader.summary || "")}</div>
       </div>
     `;
   }
 
   container.innerHTML = `
-    <div class="card">
-      <div class="card-title">
-        <span>2-Hour Publishing Window</span>
-        <span class="badge ${statusBadgeClass}">${escapeHtml(win.status)}</span>
+    <div class="window-grid">
+      <div class="stat-card">
+        <span class="stat-label">Publishing Window</span>
+        <span class="stat-value">${escapeHtml(windowId)}</span>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Window ID</span>
-        <span class="stat-value">${escapeHtml(win.windowId || "N/A")}</span>
+      <div class="stat-card">
+        <span class="stat-label">Window Status</span>
+        <span class="stat-value status-${windowStatus.toLowerCase()}">${escapeHtml(windowStatus)}</span>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Candidates Discovered</span>
-        <span class="stat-value">${win.candidateCount || 0}</span>
+      <div class="stat-card">
+        <span class="stat-label">Evaluated Stories</span>
+        <span class="stat-value">${candidateCount}</span>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Window Started</span>
-        <span class="stat-value">${formatDate(win.startedAt)}</span>
+      <div class="stat-card">
+        <span class="stat-label">Next Evaluation</span>
+        <span class="stat-value">${formatDate(endsAt)}</span>
       </div>
-      <div class="stat-row">
-        <span class="stat-label">Window Ends</span>
-        <span class="stat-value">${formatDate(win.endsAt)}</span>
-      </div>
-      <div class="stat-row">
-        <span class="stat-label">Last Publication</span>
+      <div class="stat-card">
+        <span class="stat-label">Last Published</span>
         <span class="stat-value">${formatDate(lastPublishedAt)}</span>
       </div>
     </div>
@@ -233,7 +234,10 @@ function formatDate(isoString) {
   if (!isoString) return "None";
   try {
     const d = new Date(isoString);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) + " UTC";
+    const hours = String(d.getUTCHours()).padStart(2, "0");
+    const mins = String(d.getUTCMinutes()).padStart(2, "0");
+    const secs = String(d.getUTCSeconds()).padStart(2, "0");
+    return `${hours}:${mins}:${secs} UTC`;
   } catch {
     return isoString;
   }
@@ -250,16 +254,41 @@ function escapeHtml(str) {
 }
 
 // ============================================================================
-// 5. POLLING & INITIALIZATION WORKFLOWS
+// 5. POLLING & INITIALIZATION WORKFLOWS (HIGH-003 RESILIENCE)
 // ============================================================================
 async function refreshData() {
   if (!STATE.agentId) return;
 
   try {
-    const [statusData, feedData] = await Promise.all([
-      apiClient.getStatus(STATE.agentId).catch(() => null),
-      apiClient.getFeed(STATE.agentId).catch(() => ({ posts: [] }))
-    ]);
+    let statusData = null;
+    try {
+      statusData = await apiClient.getStatus(STATE.agentId);
+    } catch (err) {
+      // HIGH-003: If backend restarted and database was reset (HTTP 404), seamlessly recover
+      if (err.message && err.message.includes("404")) {
+        console.warn("[EchoMind Client] Agent ID not found on backend (server restart). Auto-recovering session...");
+        if (STATE.personaName && STATE.personaDomain) {
+          try {
+            const initRes = await apiClient.initAgent(STATE.personaName, STATE.personaDomain);
+            STATE.agentId = initRes.agentId;
+            localStorage.setItem("echomind_agent_id", initRes.agentId);
+            updateActiveSessionUI();
+            statusData = await apiClient.getStatus(STATE.agentId);
+          } catch (initErr) {
+            console.error("[EchoMind Client] Auto-recovery failed:", initErr);
+            resetSession();
+            return;
+          }
+        } else {
+          resetSession();
+          return;
+        }
+      } else {
+        throw err;
+      }
+    }
+
+    const feedData = await apiClient.getFeed(STATE.agentId).catch(() => ({ posts: [] }));
 
     if (statusData) {
       STATE.statusData = statusData;

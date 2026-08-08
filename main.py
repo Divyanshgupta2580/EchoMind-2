@@ -12,13 +12,14 @@ FastAPI application providing:
 
 import asyncio
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Header, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -41,8 +42,8 @@ scheduler = AsyncIOScheduler()
 
 # Request / Response Schemas for Hackathon API Specification
 class PersonaInitPayload(BaseModel):
-    name: str = Field(..., description="Agent persona name (e.g. 'Ada')")
-    domain: str = Field(..., description="Technical domain (e.g. 'AI Security')")
+    name: str = Field(..., description="Human-readable agent persona identity (e.g. 'Ada')")
+    domain: str = Field(..., description="Technical domain specialization (e.g. 'AI Security')")
 
 
 class AgentInitRequest(BaseModel):
@@ -50,7 +51,7 @@ class AgentInitRequest(BaseModel):
 
 
 class AgentInitResponse(BaseModel):
-    agentId: str
+    agentId: str = Field(..., description="Unique machine identifier for the agent (e.g. 'agent-8a1b2c3d')")
 
 
 class FeedPostItem(BaseModel):
@@ -98,11 +99,15 @@ async def lifespan(app: FastAPI):
     if not scheduler.running:
         # Schedule periodic background discovery and evaluation loop (every ~5 minutes)
         # Governed by 2-hour publishing windows in AutonomousPublisherService
+        # HIGH-002: max_instances=1 and coalesce=True prevents overlapping job execution
         scheduler.add_job(
             publisher_service.run_all_agents_cycle,
             "interval",
             minutes=settings.discovery_interval_minutes,
-            id="autonomous_publishing_cycle"
+            id="autonomous_publishing_cycle",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60
         )
         scheduler.start()
         logger.info(f"[APP] Background autonomous discovery scheduler started successfully (interval: {settings.discovery_interval_minutes} min, window: {settings.publish_window_minutes} min).")
@@ -155,11 +160,9 @@ async def serve_dashboard():
 @app.post("/api/agent/init", response_model=AgentInitResponse, status_code=200)
 async def init_agent(payload: AgentInitRequest):
     """
-    Initialize an autonomous persona with a name and technology domain.
-    Called EXACTLY ONCE per agent.
-
-    Generates a unique agentId, registers the persona in memory, creates the initial
-    2-hour publishing window, and triggers the first discovery cycle immediately.
+    Initialize an autonomous persona with a human-readable name and domain.
+    Generates a unique machine identifier (agentId), registers in SQLite memory,
+    creates the initial 2-hour publishing window, and triggers initial candidate discovery.
     """
     try:
         persona_name = payload.persona.name.strip()
@@ -168,19 +171,27 @@ async def init_agent(payload: AgentInitRequest):
         if not persona_name or not persona_domain:
             raise HTTPException(status_code=400, detail="Persona name and domain must not be empty.")
 
-        # Generate clean, unique agentId (e.g. agent-8a1b2c3d)
+        # Re-use existing agent if initialized with identical name & domain in the same database session
+        for existing in memory_store.list_agents():
+            if existing["name"].lower() == persona_name.lower() and existing["domain"].lower() == persona_domain.lower():
+                agent_id = existing["agentId"]
+                memory_store.get_or_create_active_window(agent_id, duration_minutes=settings.publish_window_minutes)
+                logger.info(f"[API] Reusing existing agent id={agent_id} for persona '{persona_name}'")
+                return AgentInitResponse(agentId=agent_id)
+
+        # Generate unique machine agentId (e.g. agent-8a1b2c3d)
         agent_id = f"agent-{uuid.uuid4().hex[:8]}"
 
-        # Register in memory store
+        # Register in SQLite memory store
         memory_store.register_agent(agent_id, persona_name, persona_domain)
 
         # Create initial 2-hour publishing window
         memory_store.create_window(agent_id, duration_minutes=settings.publish_window_minutes)
 
-        # Trigger ONE initial discovery cycle immediately to populate candidates
+        # Trigger initial discovery cycle in background
         asyncio.create_task(publisher_service.run_publishing_cycle(agent_id))
 
-        logger.info(f"[API] Initialized agent '{persona_name}' in domain '{persona_domain}' with id={agent_id}")
+        logger.info(f"[API] Initialized agent '{persona_name}' in domain '{persona_domain}' with machine id={agent_id}")
         return AgentInitResponse(agentId=agent_id)
 
     except HTTPException:
@@ -309,8 +320,15 @@ async def metrics():
 
 
 @app.post("/api/agent/cycle")
-async def trigger_agent_cycle(agentId: str = Query(..., description="Agent ID to trigger immediately")):
+async def trigger_agent_cycle(
+    agentId: str = Query(..., description="Agent ID to trigger immediately"),
+    x_admin_key: str | None = Header(None, alias="X-Admin-Key")
+):
     """Manual cycle trigger endpoint for testing or simulated fast-forwarding."""
+    admin_secret = os.getenv("ADMIN_API_KEY")
+    if admin_secret and x_admin_key != admin_secret:
+        raise HTTPException(status_code=403, detail="Unauthorized cycle trigger.")
+
     result = await publisher_service.run_discovery_and_evaluation_cycle(agentId)
     return result
 
@@ -318,9 +336,14 @@ async def trigger_agent_cycle(agentId: str = Query(..., description="Agent ID to
 @app.post("/api/agent/close-window")
 async def trigger_window_close(
     agentId: str = Query(..., description="Agent ID"),
-    windowId: str = Query(..., description="Window ID to close and evaluate")
+    windowId: str = Query(..., description="Window ID to close and evaluate"),
+    x_admin_key: str | None = Header(None, alias="X-Admin-Key")
 ):
     """Manual window close trigger endpoint for testing 2-hour window evaluation."""
+    admin_secret = os.getenv("ADMIN_API_KEY")
+    if admin_secret and x_admin_key != admin_secret:
+        raise HTTPException(status_code=403, detail="Unauthorized window close trigger.")
+
     result = await publisher_service.process_window_close(agentId, windowId)
     return result
 

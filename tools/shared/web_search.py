@@ -2,10 +2,12 @@
 Web search tool using OpenRouter's native web search plugin.
 
 Provides real-time web search capability for the agent.
-Uses OpenRouter's plugins API with native search engine.
+Uses OpenRouter's plugins API with native search engine,
+with resilient regex fallback for extracting source URLs.
 """
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -38,7 +40,7 @@ async def web_search(query: str, **kwargs) -> str:
         **kwargs: Additional context (twitter, db) - not used here.
 
     Returns:
-        Formatted string with search results.
+        Formatted string with search results and verified sources.
     """
     logger.info(f"[WEB_SEARCH] Starting search: {query}")
 
@@ -75,11 +77,18 @@ async def web_search(query: str, **kwargs) -> str:
         for annotation in message.get("annotations", []):
             if annotation.get("type") == "url_citation":
                 citation = annotation.get("url_citation", {})
-                sources.append(citation.get("title", ""))
+                url = citation.get("url") or citation.get("title") or ""
+                if url:
+                    sources.append(url)
+
+        # Fallback: extract URLs from markdown or text if annotations were omitted
+        if not sources:
+            urls = re.findall(r'https?://[^\s)\]">]+', content)
+            sources = list(dict.fromkeys(urls))[:5]
 
         logger.info(f"[WEB_SEARCH] Completed: {len(sources)} sources found")
 
-        return f"Search results:\n{content}\n\nSources: {len(sources)}"
+        return f"Search results:\n{content}\n\nSources: {len(sources)}\n" + "\n".join(sources)
 
     except httpx.TimeoutException:
         logger.error(f"[WEB_SEARCH] Timeout after 60s")
