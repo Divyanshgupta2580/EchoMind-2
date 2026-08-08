@@ -5,14 +5,31 @@
  */
 
 // ============================================================================
-// 1. CENTRAL API BASE URL CONFIGURATION
+// 1. CENTRAL API BASE URL RESOLUTION
 // ============================================================================
-const DEFAULT_API_BASE_URL = "https://echomind-ltwo.onrender.com";
+// Priority:
+// 1. Explicit URL parameter: ?api=https://...
+// 2. Explicit window global: window.__API_BASE_URL__
+// 3. Same-origin relative path ("") if running inside browser on host
+// 4. Default fallback: https://echomind-ltwo.onrender.com
+const getBaseUrl = () => {
+  try {
+    const urlParams = new URLSearchParams(window.location.search);
+    const paramApi = urlParams.get("api");
+    if (paramApi) return paramApi.replace(/\/$/, "");
+    if (window.__API_BASE_URL__) return window.__API_BASE_URL__.replace(/\/$/, "");
+    if (window.location && window.location.origin && window.location.origin.startsWith("http")) {
+      // When served directly from backend (Render or localhost), relative path "" is 100% reliable
+      return "";
+    }
+  } catch (e) {
+    console.warn("[EchoMind] Could not parse URL params:", e);
+  }
+  return "https://echomind-ltwo.onrender.com";
+};
 
-const urlParams = new URLSearchParams(window.location.search);
-const API_BASE_URL = (urlParams.get("api") || window.__API_BASE_URL__ || DEFAULT_API_BASE_URL).replace(/\/$/, "");
-
-console.log("[EchoMind Client] Configured API Base URL:", API_BASE_URL);
+const API_BASE_URL = getBaseUrl();
+console.log("[EchoMind Client] Active API Base URL:", API_BASE_URL || "(same-origin)");
 
 // ============================================================================
 // 2. STATE MANAGEMENT & STORAGE
@@ -34,18 +51,23 @@ const STATE = {
 // 3. API SERVICE LAYER
 // ============================================================================
 async function apiRequest(endpoint, options = {}) {
-  const url = `${API_BASE_URL}${endpoint.startsWith("/") ? "" : "/"}${endpoint}`;
+  const cleanEndpoint = endpoint.startsWith("/") ? endpoint : `/${endpoint}`;
+  const url = API_BASE_URL ? `${API_BASE_URL}${cleanEndpoint}` : cleanEndpoint;
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), options.timeout || 35000);
+
+  const headers = { ...(options.headers || {}) };
+  // Only set Content-Type for requests with a body to prevent unnecessary CORS preflight on GET requests
+  if (options.body && !headers["Content-Type"]) {
+    headers["Content-Type"] = "application/json";
+  }
 
   try {
     const response = await fetch(url, {
       ...options,
       signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        ...(options.headers || {})
-      }
+      headers
     });
     clearTimeout(timeoutId);
 
@@ -98,7 +120,12 @@ const apiClient = {
 // 4. THEME SYSTEM (DARK & LIGHT MODE)
 // ============================================================================
 function initTheme() {
-  const savedTheme = localStorage.getItem("echomind_theme");
+  let savedTheme = "dark";
+  try {
+    savedTheme = localStorage.getItem("echomind_theme");
+  } catch (e) {
+    console.warn("Storage access:", e);
+  }
   const prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
   const initialTheme = savedTheme || (prefersLight ? "light" : "dark");
   setTheme(initialTheme);
@@ -107,7 +134,11 @@ function initTheme() {
 function setTheme(theme) {
   STATE.theme = theme;
   document.documentElement.setAttribute("data-theme", theme);
-  localStorage.setItem("echomind_theme", theme);
+  try {
+    localStorage.setItem("echomind_theme", theme);
+  } catch (e) {
+    console.warn("Storage save:", e);
+  }
 
   const toggleBtn = document.getElementById("theme-toggle-btn");
   const moonIcon = document.getElementById("theme-icon-moon");
@@ -230,9 +261,13 @@ function selectAgent(agentId) {
   STATE.personaName = target.name;
   STATE.personaDomain = target.domain;
 
-  localStorage.setItem("echomind_agent_id", target.agentId);
-  localStorage.setItem("echomind_persona_name", target.name);
-  localStorage.setItem("echomind_persona_domain", target.domain);
+  try {
+    localStorage.setItem("echomind_agent_id", target.agentId);
+    localStorage.setItem("echomind_persona_name", target.name);
+    localStorage.setItem("echomind_persona_domain", target.domain);
+  } catch (e) {
+    console.warn("Storage save:", e);
+  }
 
   updateActiveSessionUI();
   renderAgentsList();
@@ -405,12 +440,16 @@ async function refreshData() {
           STATE.agentId = newest.agentId;
           STATE.personaName = newest.name;
           STATE.personaDomain = newest.domain;
-          localStorage.setItem("echomind_agent_id", newest.agentId);
-          localStorage.setItem("echomind_persona_name", newest.name);
-          localStorage.setItem("echomind_persona_domain", newest.domain);
+          try {
+            localStorage.setItem("echomind_agent_id", newest.agentId);
+            localStorage.setItem("echomind_persona_name", newest.name);
+            localStorage.setItem("echomind_persona_domain", newest.domain);
+          } catch (e) {}
         } else {
           STATE.agentId = "";
-          localStorage.removeItem("echomind_agent_id");
+          try {
+            localStorage.removeItem("echomind_agent_id");
+          } catch (e) {}
         }
         updateActiveSessionUI();
       }
@@ -421,9 +460,11 @@ async function refreshData() {
       STATE.agentId = first.agentId;
       STATE.personaName = first.name;
       STATE.personaDomain = first.domain;
-      localStorage.setItem("echomind_agent_id", first.agentId);
-      localStorage.setItem("echomind_persona_name", first.name);
-      localStorage.setItem("echomind_persona_domain", first.domain);
+      try {
+        localStorage.setItem("echomind_agent_id", first.agentId);
+        localStorage.setItem("echomind_persona_name", first.name);
+        localStorage.setItem("echomind_persona_domain", first.domain);
+      } catch (e) {}
       updateActiveSessionUI();
     }
 
@@ -501,9 +542,11 @@ async function executeAgentCreation(name, domain) {
     STATE.personaName = name;
     STATE.personaDomain = domain;
 
-    localStorage.setItem("echomind_agent_id", res.agentId);
-    localStorage.setItem("echomind_persona_name", name);
-    localStorage.setItem("echomind_persona_domain", domain);
+    try {
+      localStorage.setItem("echomind_agent_id", res.agentId);
+      localStorage.setItem("echomind_persona_name", name);
+      localStorage.setItem("echomind_persona_domain", domain);
+    } catch (e) {}
 
     showToast(`Autonomous Persona '${name}' initialized: ${res.agentId}`);
     updateActiveSessionUI();
@@ -524,7 +567,11 @@ async function executeAgentCreation(name, domain) {
 // ============================================================================
 document.addEventListener("DOMContentLoaded", async () => {
   // 1. Initialize Theme
-  initTheme();
+  try {
+    initTheme();
+  } catch (e) {
+    console.error("[Theme] Init error:", e);
+  }
 
   // Theme toggle button click
   const themeToggleBtn = document.getElementById("theme-toggle-btn");
@@ -533,23 +580,38 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   // 2. Set configured backend label
+  const displayUrl = (API_BASE_URL || window.location.host || "echomind-ltwo.onrender.com")
+    .replace(/^https?:\/\//, "")
+    .replace(/\/$/, "");
   const backendLabel = document.getElementById("backend-url-label");
   if (backendLabel) {
-    backendLabel.textContent = API_BASE_URL.replace("https://", "");
+    backendLabel.textContent = displayUrl;
   }
 
-  // 3. Health check status
-  try {
-    updateBackendStatus("connecting", "Connecting...");
-    const health = await apiClient.checkHealth();
-    if (health && health.status === "healthy") {
-      updateBackendStatus("connected", "Connected");
-    } else {
+  // 3. Health check runner
+  const runHealthCheck = async () => {
+    try {
+      const health = await apiClient.checkHealth();
+      if (health && health.status === "healthy") {
+        updateBackendStatus("connected", "Connected");
+        STATE.backendHealthy = true;
+        return true;
+      } else {
+        updateBackendStatus("error", "Backend unavailable");
+        STATE.backendHealthy = false;
+        return false;
+      }
+    } catch (err) {
+      console.warn("[EchoMind] Health check warning:", err);
       updateBackendStatus("error", "Backend unavailable");
+      STATE.backendHealthy = false;
+      return false;
     }
-  } catch {
-    updateBackendStatus("error", "Backend unavailable");
-  }
+  };
+
+  // Immediate health check
+  updateBackendStatus("connecting", "Connecting...");
+  await runHealthCheck();
 
   // 4. Modal event listeners
   const cancelBtn = document.getElementById("modal-cancel-btn");
@@ -580,16 +642,5 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // 7. Periodic polling (15s for data, 30s for healthz)
   setInterval(refreshData, 15000);
-  setInterval(async () => {
-    try {
-      const h = await apiClient.checkHealth();
-      if (h && h.status === "healthy") {
-        updateBackendStatus("connected", "Connected");
-      } else {
-        updateBackendStatus("error", "Backend unavailable");
-      }
-    } catch {
-      updateBackendStatus("error", "Backend unavailable");
-    }
-  }, 30000);
+  setInterval(runHealthCheck, 30000);
 });
