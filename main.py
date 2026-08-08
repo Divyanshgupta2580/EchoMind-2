@@ -398,6 +398,36 @@ async def trigger_window_close(
     return result
 
 
+@app.get("/api/admin/verify-x-account")
+async def verify_x_account_diagnostic(x_admin_key: str | None = Header(None, alias="X-Admin-Key")):
+    """Temporary read-only diagnostic endpoint to verify authenticated X account via GET /2/users/me."""
+    admin_secret = os.getenv("ADMIN_API_KEY")
+    if not admin_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="ADMIN_API_KEY environment variable is not configured on server."
+        )
+
+    if x_admin_key != admin_secret:
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthorized diagnostic trigger."
+        )
+
+    res = publisher_service.publisher.verify_authenticated_account()
+    expected_handle = (getattr(settings, "x_expected_handle", "") or os.getenv("EXPECTED_X_HANDLE", "")).lstrip("@")
+    actual_handle = res.get("handle")
+    account_match = bool(actual_handle and expected_handle and actual_handle.lower() == expected_handle.lower())
+
+    return {
+        "success": res.get("success", False),
+        "authenticated_username": actual_handle,
+        "expected_username": expected_handle,
+        "account_match": account_match,
+        "error": res.get("error")
+    }
+
+
 if __name__ == "__main__":
     import os
     import uvicorn
