@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>EchoMind — Quality-Driven Autonomous Newsroom</title>
-  <meta name="description" content="Autonomous AI Newsroom governed by 2-Hour Publishing Windows and 5-Minute Continuous Discovery Loops with Multi-Agent support.">
+  <meta name="description" content="Autonomous AI Newsroom governed by Publishing Windows and 5-Minute Continuous Discovery Loops with Multi-Agent support.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -16,7 +16,7 @@
     <header class="app-header">
       <div class="brand">
         <h1 class="brand-title">EchoMind Autonomous Newsroom</h1>
-        <p class="brand-subtitle">Quality-Driven News Publisher &middot; 2-Hour Window Cadence &middot; 5-Min Discovery</p>
+        <p class="brand-subtitle">Quality-Driven News Publisher &middot; <span id="brand-cadence-label">2-Hour Window Cadence</span> &middot; 5-Min Discovery</p>
       </div>
       <div class="header-controls">
         <div class="backend-indicator">
@@ -117,7 +117,7 @@
               <span class="badge">Awaiting Init</span>
             </div>
             <div class="empty-state">
-              Select or initialize an agent above to inspect its 2-hour publishing window.
+              Select or initialize an agent above to inspect its publishing window.
             </div>
           </div>
         </div>
@@ -136,8 +136,8 @@
             </span>
           </div>
           <div id="feed-container">
-            <div class="empty-state">
-              No stories published to feed yet. At window close (120 min), the highest-scoring verified leader meeting the minimum threshold (75.0) will be published.
+            <div class="empty-state" id="feed-empty-state">
+              No stories published to feed yet. At window close, the highest-scoring verified leader meeting the minimum threshold (75.0) will be published.
             </div>
           </div>
         </div>

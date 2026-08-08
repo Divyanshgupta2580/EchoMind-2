@@ -5,7 +5,7 @@ Comprehensive tests covering:
 1. Deterministic candidate scoring calculation (0-100 across 6 criteria).
 2. Minimum threshold rejection (score < 75.0 rejected; score >= 75.0 eligible).
 3. Leader tracking & late-breaking superior news replacing earlier leader.
-4. 2-Hour window management: maximum 1 post per window.
+4. Publishing window management: 120-minute production default & 10-minute testing mode.
 5. Zero publication outcome when no candidate qualifies (NO_QUALIFIED_STORY).
 6. Deduplication across topic hashes and memory.
 7. Restart recovery of active window and leader from SQLite.
@@ -16,7 +16,7 @@ Comprehensive tests covering:
 12. HIGH-001 Safe X retries, persistent SQLite idempotency, and 403 duplicate reconciliation.
 13. HIGH-002 Per-agent asyncio.Lock preventing scheduler cycle overlap.
 14. MAX_AGENTS=5 Server-side atomic FIFO rotation and dependent data cleanup.
-15. Publication Invariant Cases A through G.
+15. Dynamic Configuration: PUBLISH_WINDOW_MINUTES (10 vs 120) and MIN_NEWS_SCORE=75.0.
 """
 
 import asyncio
@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 from config.persona_engine import build_persona_profile
-from config.settings import settings
+from config.settings import Settings, settings
 from main import app
 from services.autonomous_publisher import AutonomousPublisherService
 from services.editorial_engine import EditorialEngine
@@ -160,13 +160,92 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertIn("Story D", self.mock_publisher.published_posts[0]["text"])
 
     # =========================================================================
-    # 3. REQUIRED EDGE CASE 2: ZERO PUBLICATION OUTCOME
+    # 3. CONTROLLED TESTING PHASE: 10-MINUTE WINDOW & LEADER REPLACEMENT
+    # =========================================================================
+
+    def test_10_minute_window_leader_replacement_and_close(self):
+        """
+        CONTROLLED TESTING MODE:
+        Minute 1: Candidate A = 80
+        Minute 6: Candidate B = 93
+        Minute 10: Candidate B MUST be published at window close (93 > 80 and >= 75.0).
+        """
+        agent_id = "agent-test-10min"
+        self.memory.register_agent(agent_id, "Ada", "AI Security")
+        window = self.memory.create_window(agent_id, duration_minutes=10)
+        window_id = window["window_id"]
+
+        start_dt = datetime.strptime(window["started_at"], "%Y-%m-%dT%H:%M:%SZ")
+        end_dt = datetime.strptime(window["ends_at"], "%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual((end_dt - start_dt).total_seconds(), 600)  # Exactly 10 minutes
+
+        # Minute 1: Candidate A (Score 80.0)
+        self.memory.save_candidate(
+            candidate_id="c-10m-a",
+            agent_id=agent_id,
+            window_id=window_id,
+            title="Candidate A: Vulnerability in FlashAttention Kernel",
+            summary="Kernel crash on negative token indices.",
+            source_urls=["https://arxiv.org/abs/2608.1001"],
+            source_quality="High",
+            score=80.0,
+            score_breakdown={"total": 80.0},
+            status="LEADER",
+            discovered_at=(start_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+        l1 = self.memory.get_current_leader(window_id, min_score=75.0)
+        self.assertEqual(l1["candidate_id"], "c-10m-a")
+
+        # Minute 6: Candidate B (Score 93.0 - Superior Story)
+        self.memory.save_candidate(
+            candidate_id="c-10m-b",
+            agent_id=agent_id,
+            window_id=window_id,
+            title="Candidate B: Remote Weight Corruption via Quantization Drift",
+            summary="Zero-day exploit confirmed on production inference cluster.",
+            source_urls=["https://cve.mitre.org/cve-2026-8888"],
+            source_quality="High",
+            score=93.0,
+            score_breakdown={"total": 93.0},
+            status="LEADER",
+            discovered_at=(start_dt + timedelta(minutes=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+        self.memory.update_candidate_status("c-10m-a", "ELIGIBLE")
+
+        # Verify Candidate B replaced A as leader
+        l2 = self.memory.get_current_leader(window_id, min_score=75.0)
+        self.assertEqual(l2["candidate_id"], "c-10m-b")
+        self.assertEqual(l2["score"], 93.0)
+
+        # Close window at Minute 10
+        result = asyncio.run(self.service.process_window_close(agent_id, window_id))
+        self.assertTrue(result["success"])
+        self.assertEqual(result["window_status"], "PUBLISHED")
+        self.assertEqual(len(self.mock_publisher.published_posts), 1)
+        self.assertIn("Candidate B", self.mock_publisher.published_posts[0]["text"])
+
+    def test_configuration_publish_window_minutes_override(self):
+        """Verify settings.publish_window_minutes is dynamically configuration-driven."""
+        # 1. Default configuration must remain 120
+        default_s = Settings()
+        self.assertEqual(default_s.publish_window_minutes, 120)
+
+        # 2. Testing override to 10
+        test_s = Settings(publish_window_minutes=10)
+        self.assertEqual(test_s.publish_window_minutes, 10)
+
+        # 3. Discovery interval remains 5 minutes
+        self.assertEqual(default_s.discovery_interval_minutes, 5)
+        self.assertEqual(test_s.discovery_interval_minutes, 5)
+
+    # =========================================================================
+    # 4. REQUIRED EDGE CASE 2: ZERO PUBLICATION OUTCOME
     # =========================================================================
 
     def test_zero_publication_when_no_candidate_qualifies(self):
         """
         TEST CASE 2:
-        All candidates during the 2-hour window score below 75.0.
+        All candidates during the window score below 75.0.
         At window close -> ZERO posts published (NO_QUALIFIED_STORY).
         """
         agent_id = "agent-test-zero-pub"
@@ -216,7 +295,7 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertEqual(self.memory.count_posts(agent_id), 0)
 
     # =========================================================================
-    # 4. REQUIRED EDGE CASE 3: DEDUPLICATION
+    # 5. REQUIRED EDGE CASE 3: DEDUPLICATION
     # =========================================================================
 
     def test_deduplication_prevents_duplicate_topics(self):
@@ -265,7 +344,7 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertIn("Duplicate content", eval_result["rejection_reason"])
 
     # =========================================================================
-    # 5. REQUIRED EDGE CASE 4: RESTART RECOVERY
+    # 6. REQUIRED EDGE CASE 4: RESTART RECOVERY
     # =========================================================================
 
     def test_restart_recovery_preserves_window_and_leader(self):
@@ -314,7 +393,7 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertEqual(len(self.mock_publisher.published_posts), 1)
 
     # =========================================================================
-    # 6. CRIT-001 & CRIT-002: ATOMIC CAS LOCK & IDEMPOTENT WINDOW CLOSURE
+    # 7. CRIT-001 & CRIT-002: ATOMIC CAS LOCK & IDEMPOTENT WINDOW CLOSURE
     # =========================================================================
 
     def test_crit_001_atomic_cas_lock_prevents_duplicate_close(self):
@@ -396,7 +475,7 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertEqual(len(self.mock_publisher.published_posts), 1)
 
     # =========================================================================
-    # 7. HIGH-001: X PUBLISHER RETRIES, IDEMPOTENCY & DUPLICATE CONTENT RECOVERY
+    # 8. HIGH-001: X PUBLISHER RETRIES, IDEMPOTENCY & DUPLICATE CONTENT RECOVERY
     # =========================================================================
 
     def test_high_001_x_retry_duplicate_content_recovery(self):
@@ -440,7 +519,7 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertIsNotNone(rec)
 
     # =========================================================================
-    # 8. HIGH-002: SCHEDULER DISCOVERY CONCURRENCY LOCK
+    # 9. HIGH-002: SCHEDULER DISCOVERY CONCURRENCY LOCK
     # =========================================================================
 
     def test_high_002_scheduler_agent_lock_prevents_cycle_overlap(self):
@@ -471,22 +550,29 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertIn("skipped_overlap", actions)
 
     # =========================================================================
-    # 9. 2-HOUR WINDOW TIME MATHEMATICS
+    # 10. PUBLISHING WINDOW TIME MATHEMATICS (120 MIN VS 10 MIN)
     # =========================================================================
 
-    def test_2_hour_window_time_calculation(self):
-        """Verify that ends_at = started_at + 120 minutes in strict ISO 8601 UTC."""
-        agent_id = "agent-time-math"
-        self.memory.register_agent(agent_id, "Ada", "AI Security")
-        window = self.memory.create_window(agent_id, duration_minutes=120)
+    def test_publish_window_time_calculations(self):
+        """Verify that ends_at = started_at + duration_minutes in strict ISO 8601 UTC."""
+        # 120-minute production window
+        agent_id_120 = "agent-time-math-120"
+        self.memory.register_agent(agent_id_120, "Ada", "AI Security")
+        w_120 = self.memory.create_window(agent_id_120, duration_minutes=120)
+        s120 = datetime.strptime(w_120["started_at"], "%Y-%m-%dT%H:%M:%SZ")
+        e120 = datetime.strptime(w_120["ends_at"], "%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual((e120 - s120).total_seconds(), 7200)
 
-        start_dt = datetime.strptime(window["started_at"], "%Y-%m-%dT%H:%M:%SZ")
-        end_dt = datetime.strptime(window["ends_at"], "%Y-%m-%dT%H:%M:%SZ")
-        delta = end_dt - start_dt
-        self.assertEqual(delta.total_seconds(), 7200) # exactly 120 minutes
+        # 10-minute testing window
+        agent_id_10 = "agent-time-math-10"
+        self.memory.register_agent(agent_id_10, "Atlas", "Robotics")
+        w_10 = self.memory.create_window(agent_id_10, duration_minutes=10)
+        s10 = datetime.strptime(w_10["started_at"], "%Y-%m-%dT%H:%M:%SZ")
+        e10 = datetime.strptime(w_10["ends_at"], "%Y-%m-%dT%H:%M:%SZ")
+        self.assertEqual((e10 - s10).total_seconds(), 600)
 
     # =========================================================================
-    # 10. MAX_AGENTS=5 ATOMIC FIFO ROTATION
+    # 11. MAX_AGENTS=5 ATOMIC FIFO ROTATION
     # =========================================================================
 
     def test_max_agents_5_atomic_fifo_rotation_and_cleanup(self):
@@ -545,7 +631,7 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
             self.assertEqual(cand_count, 0, "Ada's candidates must be deleted")
 
     # =========================================================================
-    # 11. EVALUATOR API CONTRACTS & GET /api/agents
+    # 12. EVALUATOR API CONTRACTS & DYNAMIC WINDOW DURATION
     # =========================================================================
 
     def test_evaluator_api_endpoints_and_agents_list(self):
@@ -562,6 +648,7 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         agents_data = agents_res.json()
         self.assertIn("agents", agents_data)
         self.assertEqual(agents_data["maxAgents"], 5)
+        self.assertIn("publishWindowMinutes", agents_data)
         self.assertTrue(agents_data["count"] >= 1)
         first_agent = agents_data["agents"][0]
         self.assertIn("agentId", first_agent)
@@ -587,7 +674,7 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         healthz_res = client.get("/healthz")
         self.assertEqual(healthz_res.status_code, 200)
         self.assertEqual(healthz_res.json()["status"], "healthy")
-        self.assertEqual(healthz_res.json()["publish_window_minutes"], 120)
+        self.assertIn("publish_window_minutes", healthz_res.json())
         self.assertEqual(healthz_res.json()["min_news_score"], 75.0)
         self.assertEqual(healthz_res.json()["max_agents"], 5)
 

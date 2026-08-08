@@ -43,6 +43,7 @@ const STATE = {
   posts: [],
   agents: [],
   maxAgents: 5,
+  publishWindowMinutes: 120,
   backendHealthy: false,
   pendingInitPayload: null
 };
@@ -88,7 +89,11 @@ async function apiRequest(endpoint, options = {}) {
 
 const apiClient = {
   async checkHealth() {
-    return await apiRequest("/healthz", { timeout: 10000 });
+    try {
+      return await apiRequest("/healthz", { timeout: 10000 });
+    } catch (e) {
+      return await apiRequest("/health", { timeout: 10000 });
+    }
   },
 
   async getAgents(activeAgentId = "") {
@@ -117,8 +122,30 @@ const apiClient = {
 };
 
 // ============================================================================
-// 4. THEME SYSTEM (DARK & LIGHT MODE)
+// 4. THEME & CADENCE UI HELPERS
 // ============================================================================
+function formatCadenceLabel(minutes) {
+  const m = Number(minutes) || 120;
+  if (m >= 60 && m % 60 === 0) {
+    const hours = m / 60;
+    return `${hours}-Hour Window Cadence`;
+  }
+  return `${m}-Minute Window Cadence`;
+}
+
+function updateWindowCadenceUI(minutes) {
+  if (!minutes) return;
+  STATE.publishWindowMinutes = Number(minutes);
+  const label = document.getElementById("brand-cadence-label");
+  if (label) {
+    label.textContent = formatCadenceLabel(STATE.publishWindowMinutes);
+  }
+  const feedEmpty = document.getElementById("feed-empty-state");
+  if (feedEmpty && (!STATE.posts || STATE.posts.length === 0)) {
+    feedEmpty.textContent = `No stories published to feed yet. At window close (${STATE.publishWindowMinutes} min), the highest-scoring verified leader meeting the minimum threshold (75.0) will be published.`;
+  }
+}
+
 function initTheme() {
   let savedTheme = "dark";
   try {
@@ -347,8 +374,8 @@ function renderFeed() {
   if (!STATE.posts || STATE.posts.length === 0) {
     if (countEl) countEl.textContent = "(0)";
     container.innerHTML = `
-      <div class="empty-state">
-        No stories published to feed yet. At window close (120 min), the highest-scoring verified leader meeting the minimum threshold (75.0) will be published.
+      <div class="empty-state" id="feed-empty-state">
+        No stories published to feed yet. At window close (${STATE.publishWindowMinutes || 120} min), the highest-scoring verified leader meeting the minimum threshold (75.0) will be published.
       </div>
     `;
     return;
@@ -429,8 +456,13 @@ async function refreshData() {
     // 1. Fetch all agents
     const agentsRes = await apiClient.getAgents(STATE.agentId).catch(() => null);
     if (agentsRes && Array.isArray(agentsRes.agents)) {
+      STATE.backendHealthy = true;
+      updateBackendStatus("connected", "Connected");
       STATE.agents = agentsRes.agents;
       STATE.maxAgents = agentsRes.maxAgents || 5;
+      if (agentsRes.publishWindowMinutes) {
+        updateWindowCadenceUI(agentsRes.publishWindowMinutes);
+      }
       renderAgentsList();
 
       // If active agent is missing or was rotated out, select the first available agent
@@ -541,6 +573,8 @@ async function executeAgentCreation(name, domain) {
     STATE.agentId = res.agentId;
     STATE.personaName = name;
     STATE.personaDomain = domain;
+    STATE.backendHealthy = true;
+    updateBackendStatus("connected", "Connected");
 
     try {
       localStorage.setItem("echomind_agent_id", res.agentId);
@@ -592,19 +626,24 @@ document.addEventListener("DOMContentLoaded", async () => {
   const runHealthCheck = async () => {
     try {
       const health = await apiClient.checkHealth();
-      if (health && health.status === "healthy") {
+      if (health && (health.status === "healthy" || health.status === "ok" || health.scheduler_running !== undefined)) {
         updateBackendStatus("connected", "Connected");
         STATE.backendHealthy = true;
+        if (health.publish_window_minutes) {
+          updateWindowCadenceUI(health.publish_window_minutes);
+        }
         return true;
       } else {
-        updateBackendStatus("error", "Backend unavailable");
-        STATE.backendHealthy = false;
+        if (!STATE.backendHealthy) {
+          updateBackendStatus("error", "Backend unavailable");
+        }
         return false;
       }
     } catch (err) {
       console.warn("[EchoMind] Health check warning:", err);
-      updateBackendStatus("error", "Backend unavailable");
-      STATE.backendHealthy = false;
+      if (!STATE.backendHealthy) {
+        updateBackendStatus("error", "Backend unavailable");
+      }
       return false;
     }
   };

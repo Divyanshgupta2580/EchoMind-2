@@ -95,7 +95,7 @@ class AgentMemoryStore:
                 )
             """)
 
-            # 2-Hour Publishing Windows table
+            # Publishing Windows table (duration driven by configuration)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS publishing_windows (
                     window_id TEXT PRIMARY KEY,
@@ -350,7 +350,6 @@ class AgentMemoryStore:
                 }
             except sqlite3.IntegrityError as e:
                 logger.warning(f"[MEMORY] Duplicate post insertion blocked for agent {agent_id}, topic_hash {topic_hash}: {e}")
-                # Query existing post for deterministic return
                 row = conn.execute(
                     "SELECT id, created_at, text, rationale, sources_json FROM feed_posts WHERE agent_id = ? AND topic_hash = ?",
                     (agent_id, topic_hash)
@@ -479,11 +478,18 @@ class AgentMemoryStore:
             ]
 
     # =========================================================================
-    # PUBLISHING WINDOWS (2-HOUR WINDOW MANAGEMENT & CAS LOCKS)
+    # PUBLISHING WINDOWS (CONFIGURATION-DRIVEN DURATION & CAS LOCKS)
     # =========================================================================
 
-    def create_window(self, agent_id: str, duration_minutes: int = 120) -> dict[str, Any]:
-        """Create a new publishing window."""
+    def create_window(self, agent_id: str, duration_minutes: int | None = None) -> dict[str, Any]:
+        """
+        Create a new publishing window.
+        Duration is configuration-driven via settings.publish_window_minutes (default 120, overrideable).
+        """
+        if duration_minutes is None:
+            from config.settings import settings
+            duration_minutes = settings.publish_window_minutes
+
         window_id = f"win-{uuid.uuid4().hex[:8]}"
         now = datetime.now(timezone.utc)
         started_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -498,7 +504,7 @@ class AgentMemoryStore:
                 (window_id, agent_id, started_at, ends_at)
             )
             conn.commit()
-        logger.info(f"[WINDOW] Created window {window_id} for agent {agent_id}: {started_at} -> {ends_at}")
+        logger.info(f"[WINDOW] Created window {window_id} ({duration_minutes}m) for agent {agent_id}: {started_at} -> {ends_at}")
         return {
             "window_id": window_id,
             "agent_id": agent_id,
@@ -537,11 +543,15 @@ class AgentMemoryStore:
                 return dict(row)
             return None
 
-    def get_or_create_active_window(self, agent_id: str, duration_minutes: int = 120) -> dict[str, Any]:
+    def get_or_create_active_window(self, agent_id: str, duration_minutes: int | None = None) -> dict[str, Any]:
         """
         Get the active open window or automatically create a new one.
         Handles restart recovery seamlessly.
         """
+        if duration_minutes is None:
+            from config.settings import settings
+            duration_minutes = settings.publish_window_minutes
+
         active = self.get_active_window(agent_id)
         if active:
             return active

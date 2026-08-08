@@ -3,12 +3,12 @@ Autonomous AI & Technology Persona News Publisher.
 
 FastAPI application providing:
 - Web Dashboard interface at / and /dashboard (connected to central API base URL)
-- GET /api/agents: List all active autonomous agents (up to 5) with real-time status
+- GET /api/agents: List all active autonomous agents (up to 5) with real-time status and configured window duration
 - POST /api/agent/init: Initialize autonomous persona with name & domain (enforcing MAX_AGENTS=5)
 - GET /api/agent/feed: Fetch reverse-chronological feed with rationale and sources
 - GET /api/agent/status: Real-time window, leader, candidate count, and publication status
 - GET /health and GET /healthz: Lightweight health check endpoints
-- 5-Minute continuous background discovery and 2-Hour publishing window scheduling via APScheduler
+- 5-Minute continuous background discovery and configuration-driven publishing window scheduling via APScheduler
 """
 
 import asyncio
@@ -68,6 +68,7 @@ class AgentListResponse(BaseModel):
     agents: list[AgentListItem]
     count: int
     maxAgents: int = 5
+    publishWindowMinutes: int = 120
 
 
 class FeedPostItem(BaseModel):
@@ -114,7 +115,7 @@ async def lifespan(app: FastAPI):
     # Start the background task scheduler
     if not scheduler.running:
         # Schedule periodic background discovery and evaluation loop (every ~5 minutes)
-        # Governed by 2-hour publishing windows in AutonomousPublisherService
+        # Governed by publishing windows in AutonomousPublisherService
         # HIGH-002: max_instances=1 and coalesce=True prevents overlapping job execution
         scheduler.add_job(
             publisher_service.run_all_agents_cycle,
@@ -139,7 +140,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Autonomous AI & Technology Persona News Publisher",
-    description="Quality-driven autonomous news publisher with 5-minute discovery loops and 2-hour publishing windows",
+    description="Quality-driven autonomous news publisher with 5-minute discovery loops and configuration-driven publishing windows",
     version="3.0.0",
     lifespan=lifespan
 )
@@ -177,7 +178,7 @@ async def serve_dashboard():
 async def list_all_agents(activeAgentId: str | None = Query(None, description="Currently active dashboard agent")):
     """
     List all active autonomous agents (up to MAX_AGENTS=5) with their real-time
-    publishing window, candidate count, and current leader status.
+    publishing window, candidate count, current leader status, and configured window duration.
     Does NOT expose any secrets or credentials.
     """
     try:
@@ -185,7 +186,8 @@ async def list_all_agents(activeAgentId: str | None = Query(None, description="C
         return AgentListResponse(
             agents=[AgentListItem(**a) for a in agents_data],
             count=len(agents_data),
-            maxAgents=settings.max_agents
+            maxAgents=settings.max_agents,
+            publishWindowMinutes=settings.publish_window_minutes
         )
     except Exception as e:
         logger.error(f"[API] Error listing agents: {e}")
@@ -199,7 +201,7 @@ async def init_agent(payload: AgentInitRequest):
     Enforces server-side MAX_AGENTS=5 FIFO rotation: if 5 agents already exist,
     atomically evicts the oldest agent and all owned records.
     Generates a unique machine identifier (agentId), registers in SQLite memory,
-    creates the initial 2-hour publishing window, and triggers background discovery.
+    creates the initial publishing window, and triggers background discovery.
     """
     try:
         persona_name = payload.persona.name.strip()
@@ -214,7 +216,7 @@ async def init_agent(payload: AgentInitRequest):
         # Register in SQLite memory store with atomic FIFO 5-agent rotation
         memory_store.register_agent(agent_id, persona_name, persona_domain, max_agents=settings.max_agents)
 
-        # Create initial 2-hour publishing window
+        # Create initial publishing window (duration driven by settings.publish_window_minutes)
         memory_store.create_window(agent_id, duration_minutes=settings.publish_window_minutes)
 
         # Trigger initial discovery cycle in background
@@ -361,6 +363,8 @@ async def metrics():
         "agents_count": len(agents),
         "total_posts": memory_store.count_posts(),
         "max_agents": settings.max_agents,
+        "publish_window_minutes": settings.publish_window_minutes,
+        "discovery_interval_minutes": settings.discovery_interval_minutes,
         "agents": agents
     }
 
@@ -385,7 +389,7 @@ async def trigger_window_close(
     windowId: str = Query(..., description="Window ID to close and evaluate"),
     x_admin_key: str | None = Header(None, alias="X-Admin-Key")
 ):
-    """Manual window close trigger endpoint for testing 2-hour window evaluation."""
+    """Manual window close trigger endpoint for testing window evaluation."""
     admin_secret = os.getenv("ADMIN_API_KEY")
     if admin_secret and x_admin_key != admin_secret:
         raise HTTPException(status_code=403, detail="Unauthorized window close trigger.")
