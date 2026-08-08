@@ -8,6 +8,7 @@ Loads configuration from environment variables and .env file with resilient defa
 - SQLite database storage path.
 - 5-Minute continuous discovery interval & 2-Hour publishing window duration.
 - Configurable minimum news score threshold (default: 75.0).
+- Multi-agent cap (MAX_AGENTS = 5).
 """
 
 import os
@@ -31,6 +32,9 @@ class Settings(BaseSettings):
         "ECHOMIND_API_BASE_URL",
         os.getenv("API_BASE_URL", "https://echomind-ltwo.onrender.com")
     ).rstrip("/")
+
+    # Multi-agent capacity limit (default: 5)
+    max_agents: int = int(os.getenv("MAX_AGENTS", "5"))
 
     # OpenRouter API (used for LLM inference & web search)
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
@@ -58,6 +62,9 @@ class Settings(BaseSettings):
     discovery_interval_minutes: int = int(os.getenv("DISCOVERY_INTERVAL_MINUTES", os.getenv("AGENT_INTERVAL_MINUTES", "5")))
     publish_window_minutes: int = int(os.getenv("PUBLISH_WINDOW_MINUTES", "120"))
     min_news_score: float = float(os.getenv("MIN_NEWS_SCORE", "75.0"))
+
+    # Optional Admin API Secret for manual debug endpoints
+    admin_api_key: str = os.getenv("ADMIN_API_KEY", "")
 
     # Legacy flags preserved for backwards compatibility
     agent_interval_minutes: int = int(os.getenv("AGENT_INTERVAL_MINUTES", "5"))

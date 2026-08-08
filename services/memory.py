@@ -8,7 +8,7 @@ Provides thread-safe, resilient persistence using SQLite with WAL mode, storing:
 - Publishing Windows (window_id, agent_id, started_at, ends_at, status, selected_candidate_id, published_at, post_id)
 - News Candidates (candidate_id, agent_id, window_id, title, summary, source_urls, source_quality, discovered_at, score, score_breakdown, status, rejection_reason, topic_hash)
 - X Publication Records for cross-restart idempotent posting deduplication
-- Topic Fingerprints / Hashes for deduplication
+- Enforces MAX_AGENTS=5 server-side atomic FIFO rotation.
 """
 
 import hashlib
@@ -161,20 +161,61 @@ class AgentMemoryStore:
         return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
     # =========================================================================
-    # AGENT MANAGEMENT
+    # AGENT MANAGEMENT & ATOMIC FIFO 5-AGENT ROTATION
     # =========================================================================
 
-    def register_agent(self, agent_id: str, name: str, domain: str) -> dict[str, Any]:
-        """Register a new autonomous agent."""
+    def register_agent(self, agent_id: str, name: str, domain: str, max_agents: int = 5) -> dict[str, Any]:
+        """
+        Register a new autonomous agent with server-side atomic FIFO rotation.
+        If existing agents count >= max_agents (default 5), atomically deletes the oldest agent
+        and all owned dependent records (windows, candidates, feed posts, decisions, x records).
+        """
         now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._get_connection() as conn:
+            # Query existing agents ordered strictly by persisted creation timestamp ASC
+            rows = conn.execute("SELECT agent_id, name, created_at FROM agents ORDER BY created_at ASC").fetchall()
+            
+            # Enforce 5-agent limit: rotate out oldest agent if at or above capacity
+            if len(rows) >= max_agents:
+                excess_count = (len(rows) - max_agents) + 1
+                oldest_to_evict = rows[:excess_count]
+                for old in oldest_to_evict:
+                    old_id = old["agent_id"]
+                    logger.info(f"[MEMORY] Enforcing MAX_AGENTS={max_agents}: Evicting oldest agent '{old['name']}' ({old_id}, created {old['created_at']})")
+                    # Delete all dependent data owned by the evicted agent
+                    conn.execute("DELETE FROM publishing_windows WHERE agent_id = ?", (old_id,))
+                    conn.execute("DELETE FROM news_candidates WHERE agent_id = ?", (old_id,))
+                    conn.execute("DELETE FROM feed_posts WHERE agent_id = ?", (old_id,))
+                    conn.execute("DELETE FROM editorial_decisions WHERE agent_id = ?", (old_id,))
+                    conn.execute("DELETE FROM x_publication_records WHERE agent_id = ?", (old_id,))
+                    conn.execute("DELETE FROM agents WHERE agent_id = ?", (old_id,))
+
+            # Insert new agent
             conn.execute(
-                "INSERT OR REPLACE INTO agents (agent_id, name, domain, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO agents (agent_id, name, domain, created_at) VALUES (?, ?, ?, ?)",
                 (agent_id, name, domain, now_utc)
             )
             conn.commit()
-        logger.info(f"[MEMORY] Registered agent '{name}' ({domain}) with id={agent_id}")
+
+        logger.info(f"[MEMORY] Registered agent '{name}' ({domain}) with machine id={agent_id}")
         return {"agentId": agent_id, "name": name, "domain": domain, "createdAt": now_utc}
+
+    def delete_agent(self, agent_id: str) -> bool:
+        """
+        Explicitly delete an agent and all owned records across all tables atomically.
+        """
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM publishing_windows WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM news_candidates WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM feed_posts WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM editorial_decisions WHERE agent_id = ?", (agent_id,))
+            conn.execute("DELETE FROM x_publication_records WHERE agent_id = ?", (agent_id,))
+            cur = conn.execute("DELETE FROM agents WHERE agent_id = ?", (agent_id,))
+            conn.commit()
+            deleted = cur.rowcount > 0
+            if deleted:
+                logger.info(f"[MEMORY] Deleted agent {agent_id} and all associated records.")
+            return deleted
 
     def get_agent(self, agent_id: str) -> dict[str, Any] | None:
         """Get agent profile by agent_id."""
@@ -190,7 +231,7 @@ class AgentMemoryStore:
             return None
 
     def list_agents(self) -> list[dict[str, Any]]:
-        """List all registered agents."""
+        """List all registered agents ordered by created_at ASC."""
         with self._get_connection() as conn:
             rows = conn.execute("SELECT * FROM agents ORDER BY created_at ASC").fetchall()
             return [
@@ -202,6 +243,62 @@ class AgentMemoryStore:
                 }
                 for r in rows
             ]
+
+    def get_agents_detailed_status(self, active_agent_id: str | None = None) -> list[dict[str, Any]]:
+        """
+        Retrieve all agents with real-time window, candidate count, leader, and active indicator.
+        Used to render the multi-agent dashboard cards.
+        """
+        agents = self.list_agents()
+        result = []
+        for a in agents:
+            aid = a["agentId"]
+            window = self.get_active_window(aid) or self.get_latest_window(aid)
+            candidate_count = 0
+            current_leader = None
+            last_published = None
+            window_status = "OPEN"
+            window_id = None
+            started_at = None
+            ends_at = None
+
+            if window:
+                window_id = window["window_id"]
+                window_status = window["status"]
+                started_at = window["started_at"]
+                ends_at = window["ends_at"]
+                candidates = self.get_candidates_for_window(window_id)
+                candidate_count = len(candidates)
+                leader = self.get_current_leader(window_id, min_score=75.0)
+                if leader:
+                    current_leader = {
+                        "candidateId": leader["candidate_id"],
+                        "title": leader["title"],
+                        "score": leader["score"],
+                        "summary": leader.get("summary")
+                    }
+
+            feed = self.get_feed(aid, limit=1)
+            if feed:
+                last_published = feed[0]["createdAt"]
+
+            result.append({
+                "agentId": aid,
+                "name": a["name"],
+                "domain": a["domain"],
+                "createdAt": a["createdAt"],
+                "isActive": (aid == active_agent_id) if active_agent_id else False,
+                "status": {
+                    "windowId": window_id,
+                    "windowStatus": window_status,
+                    "startedAt": started_at,
+                    "endsAt": ends_at,
+                    "candidateCount": candidate_count,
+                    "currentLeader": current_leader,
+                    "lastPublishedAt": last_published
+                }
+            })
+        return result
 
     # =========================================================================
     # FEED POSTS & PERSISTENCE

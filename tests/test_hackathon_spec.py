@@ -10,12 +10,13 @@ Comprehensive tests covering:
 6. Deduplication across topic hashes and memory.
 7. Restart recovery of active window and leader from SQLite.
 8. MockXPublisher character limit validation (<= 280 chars) and idempotency.
-9. Evaluator API endpoints: POST /api/agent/init, GET /api/agent/feed, GET /api/agent/status, GET /healthz.
+9. Evaluator API endpoints: POST /api/agent/init, GET /api/agent/feed, GET /api/agent/status, GET /healthz, GET /api/agents.
 10. CRIT-001 Atomic CAS window-close lock under concurrent invocations.
 11. CRIT-002 Non-open windows (PUBLISHED, NO_QUALIFIED_STORY) cannot be re-closed.
 12. HIGH-001 Safe X retries, persistent SQLite idempotency, and 403 duplicate reconciliation.
 13. HIGH-002 Per-agent asyncio.Lock preventing scheduler cycle overlap.
-14. Publication Invariant Cases A through G.
+14. MAX_AGENTS=5 Server-side atomic FIFO rotation and dependent data cleanup.
+15. Publication Invariant Cases A through G.
 """
 
 import asyncio
@@ -485,23 +486,95 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertEqual(delta.total_seconds(), 7200) # exactly 120 minutes
 
     # =========================================================================
-    # 10. EVALUATOR API CONTRACTS & STATUS API
+    # 10. MAX_AGENTS=5 ATOMIC FIFO ROTATION
     # =========================================================================
 
-    def test_evaluator_api_endpoints(self):
-        """Test POST /api/agent/init, GET /api/agent/feed, GET /api/agent/status, and GET /healthz."""
+    def test_max_agents_5_atomic_fifo_rotation_and_cleanup(self):
+        """
+        MAX_AGENTS=5:
+        1. Register 5 agents: Ada, Atlas, Nova, Orion, Vega.
+        2. Verify count = 5.
+        3. Register 6th agent: Luna.
+        4. Verify Ada (oldest) is permanently removed from active SQLite DB.
+        5. Verify exactly 5 agents remain: Atlas, Nova, Orion, Vega, Luna.
+        6. Verify all dependent data of Ada is deleted.
+        """
+        # 1. Create first 5 agents
+        names = [("Ada", "AI Security"), ("Atlas", "Robotics"), ("Nova", "Cloud Security"), ("Orion", "AI Research"), ("Vega", "AI Ethics")]
+        agent_ids = []
+        for name, domain in names:
+            aid = f"agent-{name.lower()}"
+            self.memory.register_agent(aid, name, domain, max_agents=5)
+            self.memory.create_window(aid, duration_minutes=120)
+            self.memory.save_candidate(
+                candidate_id=f"c-{aid}",
+                agent_id=aid,
+                window_id=f"win-{aid}",
+                title=f"Initial discovery for {name}",
+                summary="Initial test summary",
+                source_urls=["https://arxiv.org"],
+                source_quality="High",
+                score=80.0,
+                score_breakdown={"total": 80.0},
+                status="ELIGIBLE"
+            )
+            agent_ids.append(aid)
+
+        initial_agents = self.memory.list_agents()
+        self.assertEqual(len(initial_agents), 5)
+        self.assertEqual(initial_agents[0]["agentId"], "agent-ada")
+
+        # 2. Create 6th agent Luna
+        self.memory.register_agent("agent-luna", "Luna", "Autonomous Agents", max_agents=5)
+        self.memory.create_window("agent-luna", duration_minutes=120)
+
+        # 3. Verify exactly 5 agents remain
+        updated_agents = self.memory.list_agents()
+        self.assertEqual(len(updated_agents), 5)
+
+        remaining_ids = [a["agentId"] for a in updated_agents]
+        self.assertNotIn("agent-ada", remaining_ids, "Ada (oldest) must have been evicted")
+        self.assertIn("agent-luna", remaining_ids, "Luna must have been added")
+        self.assertEqual(remaining_ids, ["agent-atlas", "agent-nova", "agent-orion", "agent-vega", "agent-luna"])
+
+        # 4. Verify Ada's dependent records were deleted
+        with self.memory._get_connection() as conn:
+            win_count = conn.execute("SELECT COUNT(*) as c FROM publishing_windows WHERE agent_id = 'agent-ada'").fetchone()["c"]
+            cand_count = conn.execute("SELECT COUNT(*) as c FROM news_candidates WHERE agent_id = 'agent-ada'").fetchone()["c"]
+            self.assertEqual(win_count, 0, "Ada's windows must be deleted")
+            self.assertEqual(cand_count, 0, "Ada's candidates must be deleted")
+
+    # =========================================================================
+    # 11. EVALUATOR API CONTRACTS & GET /api/agents
+    # =========================================================================
+
+    def test_evaluator_api_endpoints_and_agents_list(self):
+        """Test GET /api/agents, POST /api/agent/init, GET /api/agent/feed, GET /api/agent/status, and GET /healthz."""
         # 1. POST /api/agent/init
         init_res = client.post("/api/agent/init", json={"persona": {"name": "Ada", "domain": "AI Security"}})
         self.assertEqual(init_res.status_code, 200)
         agent_id = init_res.json()["agentId"]
         self.assertTrue(len(agent_id) > 0)
 
-        # 2. GET /api/agent/feed
+        # 2. GET /api/agents
+        agents_res = client.get("/api/agents")
+        self.assertEqual(agents_res.status_code, 200)
+        agents_data = agents_res.json()
+        self.assertIn("agents", agents_data)
+        self.assertEqual(agents_data["maxAgents"], 5)
+        self.assertTrue(agents_data["count"] >= 1)
+        first_agent = agents_data["agents"][0]
+        self.assertIn("agentId", first_agent)
+        self.assertIn("status", first_agent)
+        self.assertNotIn("x_api_key", str(agents_data))
+        self.assertNotIn("openrouter_api_key", str(agents_data))
+
+        # 3. GET /api/agent/feed
         feed_res = client.get(f"/api/agent/feed?agentId={agent_id}")
         self.assertEqual(feed_res.status_code, 200)
         self.assertIn("posts", feed_res.json())
 
-        # 3. GET /api/agent/status
+        # 4. GET /api/agent/status
         status_res = client.get(f"/api/agent/status?agentId={agent_id}")
         self.assertEqual(status_res.status_code, 200)
         status_data = status_res.json()
@@ -510,19 +583,20 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertEqual(status_data["window"]["status"], "OPEN")
         self.assertIn("candidateCount", status_data["window"])
 
-        # 4. GET /healthz & /health
+        # 5. GET /healthz & /health
         healthz_res = client.get("/healthz")
         self.assertEqual(healthz_res.status_code, 200)
         self.assertEqual(healthz_res.json()["status"], "healthy")
         self.assertEqual(healthz_res.json()["publish_window_minutes"], 120)
         self.assertEqual(healthz_res.json()["min_news_score"], 75.0)
+        self.assertEqual(healthz_res.json()["max_agents"], 5)
 
-        # 5. GET / and /dashboard (Web Client Interface)
+        # 6. GET / and /dashboard (Web Client Interface)
         dash_res = client.get("/")
         self.assertEqual(dash_res.status_code, 200)
         self.assertIn("text/html", dash_res.headers.get("content-type", ""))
 
-        # 6. Centralized API Base URL Configuration
+        # 7. Centralized API Base URL Configuration
         self.assertEqual(settings.api_base_url, "https://echomind-ltwo.onrender.com")
 
 

@@ -3,7 +3,8 @@ Autonomous AI & Technology Persona News Publisher.
 
 FastAPI application providing:
 - Web Dashboard interface at / and /dashboard (connected to central API base URL)
-- POST /api/agent/init: Initialize autonomous persona with name & domain
+- GET /api/agents: List all active autonomous agents (up to 5) with real-time status
+- POST /api/agent/init: Initialize autonomous persona with name & domain (enforcing MAX_AGENTS=5)
 - GET /api/agent/feed: Fetch reverse-chronological feed with rationale and sources
 - GET /api/agent/status: Real-time window, leader, candidate count, and publication status
 - GET /health and GET /healthz: Lightweight health check endpoints
@@ -52,6 +53,21 @@ class AgentInitRequest(BaseModel):
 
 class AgentInitResponse(BaseModel):
     agentId: str = Field(..., description="Unique machine identifier for the agent (e.g. 'agent-8a1b2c3d')")
+
+
+class AgentListItem(BaseModel):
+    agentId: str
+    name: str
+    domain: str
+    createdAt: str
+    isActive: bool = False
+    status: dict[str, Any] = {}
+
+
+class AgentListResponse(BaseModel):
+    agents: list[AgentListItem]
+    count: int
+    maxAgents: int = 5
 
 
 class FeedPostItem(BaseModel):
@@ -154,15 +170,36 @@ async def serve_dashboard():
 
 
 # ============================================================================
-# REQUIRED HACKATHON EVALUATOR API ENDPOINTS
+# REQUIRED HACKATHON EVALUATOR & MULTI-AGENT API ENDPOINTS
 # ============================================================================
+
+@app.get("/api/agents", response_model=AgentListResponse, status_code=200)
+async def list_all_agents(activeAgentId: str | None = Query(None, description="Currently active dashboard agent")):
+    """
+    List all active autonomous agents (up to MAX_AGENTS=5) with their real-time
+    publishing window, candidate count, and current leader status.
+    Does NOT expose any secrets or credentials.
+    """
+    try:
+        agents_data = memory_store.get_agents_detailed_status(active_agent_id=activeAgentId)
+        return AgentListResponse(
+            agents=[AgentListItem(**a) for a in agents_data],
+            count=len(agents_data),
+            maxAgents=settings.max_agents
+        )
+    except Exception as e:
+        logger.error(f"[API] Error listing agents: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error listing agents.")
+
 
 @app.post("/api/agent/init", response_model=AgentInitResponse, status_code=200)
 async def init_agent(payload: AgentInitRequest):
     """
     Initialize an autonomous persona with a human-readable name and domain.
+    Enforces server-side MAX_AGENTS=5 FIFO rotation: if 5 agents already exist,
+    atomically evicts the oldest agent and all owned records.
     Generates a unique machine identifier (agentId), registers in SQLite memory,
-    creates the initial 2-hour publishing window, and triggers initial candidate discovery.
+    creates the initial 2-hour publishing window, and triggers background discovery.
     """
     try:
         persona_name = payload.persona.name.strip()
@@ -171,19 +208,11 @@ async def init_agent(payload: AgentInitRequest):
         if not persona_name or not persona_domain:
             raise HTTPException(status_code=400, detail="Persona name and domain must not be empty.")
 
-        # Re-use existing agent if initialized with identical name & domain in the same database session
-        for existing in memory_store.list_agents():
-            if existing["name"].lower() == persona_name.lower() and existing["domain"].lower() == persona_domain.lower():
-                agent_id = existing["agentId"]
-                memory_store.get_or_create_active_window(agent_id, duration_minutes=settings.publish_window_minutes)
-                logger.info(f"[API] Reusing existing agent id={agent_id} for persona '{persona_name}'")
-                return AgentInitResponse(agentId=agent_id)
-
         # Generate unique machine agentId (e.g. agent-8a1b2c3d)
         agent_id = f"agent-{uuid.uuid4().hex[:8]}"
 
-        # Register in SQLite memory store
-        memory_store.register_agent(agent_id, persona_name, persona_domain)
+        # Register in SQLite memory store with atomic FIFO 5-agent rotation
+        memory_store.register_agent(agent_id, persona_name, persona_domain, max_agents=settings.max_agents)
 
         # Create initial 2-hour publishing window
         memory_store.create_window(agent_id, duration_minutes=settings.publish_window_minutes)
@@ -199,6 +228,21 @@ async def init_agent(payload: AgentInitRequest):
     except Exception as e:
         logger.error(f"[API] Error in agent initialization: {e}")
         raise HTTPException(status_code=500, detail="Internal server error during agent initialization.")
+
+
+@app.delete("/api/agent/{agent_id}", status_code=200)
+async def delete_single_agent(agent_id: str):
+    """Explicitly remove an agent and its owned data."""
+    try:
+        deleted = memory_store.delete_agent(agent_id.strip())
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Agent not found.")
+        return {"success": True, "deletedAgentId": agent_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[API] Error deleting agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error deleting agent.")
 
 
 @app.get("/api/agent/feed", response_model=FeedResponse, status_code=200)
@@ -303,6 +347,7 @@ async def health_check():
         "discovery_interval_minutes": settings.discovery_interval_minutes,
         "publish_window_minutes": settings.publish_window_minutes,
         "min_news_score": settings.min_news_score,
+        "max_agents": settings.max_agents,
         "api_base_url": settings.api_base_url,
         "version": "3.0.0"
     }
@@ -315,6 +360,7 @@ async def metrics():
     return {
         "agents_count": len(agents),
         "total_posts": memory_store.count_posts(),
+        "max_agents": settings.max_agents,
         "agents": agents
     }
 
