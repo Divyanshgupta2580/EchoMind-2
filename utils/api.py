@@ -21,6 +21,6 @@ def get_openrouter_headers() -> dict:
     return {
         "Authorization": f"Bearer {settings.openrouter_api_key}",
         "Content-Type": "application/json",
-        "X-Title": "Twitter Agent Bot"
+        "X-Title": "Autonomous AI & Technology Persona"
     }
 

@@ -64,7 +64,7 @@ They are stickers. They don't change. Ever.
 
 ---
 
-## ⚠️ THE MAIN PROBLEM TO SOLVE
+## THE MAIN PROBLEM TO SOLVE
 
 The danger is making similar images over and over. This happens when you:
 - Default to "nice digital illustration" style

@@ -208,5 +208,22 @@ class TestHackathonSpecification(unittest.TestCase):
         self.assertTrue(len(latest["sources"]) > 0)
 
 
+    def test_custom_agent_db_path_creates_parent_directory(self):
+        """Test custom AGENT_DB_PATH (e.g. /data/agent_memory.db) automatically creates parent directory."""
+        import os
+        import tempfile
+        import shutil
+        temp_dir = tempfile.mkdtemp()
+        try:
+            nested_db = os.path.join(temp_dir, "nested_dir", "sub", "custom_memory.db")
+            store = AgentMemoryStore(nested_db)
+            store.register_agent("test-custom-path", "CustomBot", "AI Security")
+            retrieved = store.get_agent("test-custom-path")
+            self.assertIsNotNone(retrieved)
+            self.assertEqual(retrieved["name"], "CustomBot")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

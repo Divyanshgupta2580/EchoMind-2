@@ -9,6 +9,9 @@
 
 # Local SQLite databases & test artifacts
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
 agent_memory.db

@@ -1,112 +1,83 @@
-# Deploying to Render
+# Deploying to Render: Autonomous AI & Technology Persona
 
-Render is a simple platform similar to Railway with good free tier options.
+This guide covers deploying the Autonomous AI Persona application to Render as a Web Service with persistent storage.
 
-## Prerequisites
+---
 
-- GitHub account
+## 1. Prerequisites
 - Render account ([render.com](https://render.com))
-- Twitter Developer account with API keys
-- OpenRouter API key
+- OpenRouter API key ([openrouter.ai](https://openrouter.ai))
 
-## Step 1: Fork the Repository
+---
 
-1. Fork this repository to your GitHub account
-2. Clone locally if you want to customize prompts/personality
+## 2. Deploying on Render
 
-## Step 2: Create PostgreSQL Database
+### Step 1: Create Web Service
+1. In Render Dashboard, click **New +** → **Web Service**.
+2. Connect your GitHub repository.
+3. Configure the service:
+   - **Name:** `autonomous-ai-persona`
+   - **Region:** Any region (e.g. Oregon, Frankfurt)
+   - **Branch:** `main`
+   - **Runtime:** `Docker` (or `Python 3` with Build Command: `pip install -r requirements.txt` and Start Command: `python main.py`)
+   - **Plan:** Free or Starter
 
-1. Go to [render.com](https://render.com) and sign in
-2. Click "New" → "PostgreSQL"
-3. Configure:
-   - Name: `agent-db`
-   - Region: Choose closest to you
-   - Plan: Free (or Starter for production)
-4. Click "Create Database"
-5. Wait for provisioning, then copy the **Internal Database URL**
+### Step 2: Configure Environment Variables
+In the **Environment** tab, set:
 
-## Step 3: Create Web Service
+| Variable | Value / Description | Required? |
+| :--- | :--- | :--- |
+| `OPENROUTER_API_KEY` | `sk-or-v1-...` | **Yes** (for live LLM inference & web search) |
+| `AGENT_DB_PATH` | `/data/agent_memory.db` | **Yes** (when using persistent disk) |
+| `PORT` | `8080` | Render default is injected automatically |
 
-1. Click "New" → "Web Service"
-2. Connect your GitHub account if not already
-3. Select your forked repository
-4. Configure:
-   - Name: `twitter-agent`
-   - Region: Same as database
-   - Branch: `main`
-   - Runtime: Python 3
-   - Build Command: `pip install -r requirements.txt`
-   - Start Command: `python main.py`
-5. Select instance type (Starter recommended)
+### Step 3: Attach Persistent Disk (Recommended)
+1. Go to the **Disks** section in your Web Service settings.
+2. Click **Add Disk**:
+   - **Name:** `persona-data`
+   - **Mount Path:** `/data`
+   - **Size:** `1 GB` (Standard)
+3. Click **Save**.
 
-## Step 4: Set Environment Variables
+---
 
-In the web service settings, add these environment variables:
+## 3. Verifying the Deployment
 
+Once the service is Live, verify via the evaluator API:
+
+### 1. Initialize Persona (POST /api/agent/init)
+```bash
+curl -X POST https://autonomous-ai-persona.onrender.com/api/agent/init \
+  -H "Content-Type: application/json" \
+  -d '{
+    "persona": {
+      "name": "Ada",
+      "domain": "AI Security"
+    }
+  }'
 ```
-DATABASE_URL=<paste Internal Database URL from Step 2>
-OPENROUTER_API_KEY=sk-or-v1-...
-TWITTER_API_KEY=...
-TWITTER_API_SECRET=...
-TWITTER_ACCESS_TOKEN=...
-TWITTER_ACCESS_SECRET=...
-TWITTER_BEARER_TOKEN=...
-POST_INTERVAL_MINUTES=30
-MENTIONS_INTERVAL_MINUTES=20
-ENABLE_IMAGE_GENERATION=true
-PORT=8080
+**Expected Response (200 OK):**
+```json
+{
+  "agentId": "agent-8a1b2c3d"
+}
 ```
 
-## Step 5: Deploy
-
-1. Click "Create Web Service"
-2. Render will build and deploy automatically
-3. Wait for "Live" status
-
-## Step 6: Verify Deployment
-
-1. Click on your service URL (e.g., `twitter-agent.onrender.com`)
-2. Visit `https://twitter-agent.onrender.com/health`
-3. Should return `{"status": "healthy"}`
-
-## Important: Prevent Sleep
-
-Render free tier services sleep after 15 minutes of inactivity. To prevent this:
-
-### Option 1: Use Starter Plan ($7/mo)
-Starter plan services don't sleep.
-
-### Option 2: External Ping Service
-Use a free service like [UptimeRobot](https://uptimerobot.com) to ping your `/health` endpoint every 5 minutes.
-
-### Option 3: Cron-job.org
-Set up a free cron job at [cron-job.org](https://cron-job.org) to hit your endpoint regularly.
-
-## Troubleshooting
-
-### Service keeps sleeping
-
-- Upgrade to Starter plan, or
-- Set up external ping service
-
-### Database connection timeout
-
-1. Ensure you're using the **Internal** Database URL (not External)
-2. Check database is in same region as web service
-
-### Build failures
-
-1. Check Python version compatibility
-2. Ensure `requirements.txt` is in root directory
-3. Check build logs for specific errors
-
-## Costs
-
-Render pricing (as of 2024):
-
-| Service | Free | Starter |
-|---------|------|---------|
-| Web Service | Sleep after 15min | $7/mo |
-| PostgreSQL | 90 days, then $7/mo | $7/mo |
-
-**Recommended**: Starter plan for both ($14/mo total) for reliable 24/7 operation.
+### 2. Retrieve Feed (GET /api/agent/feed)
+```bash
+curl "https://autonomous-ai-persona.onrender.com/api/agent/feed?agentId=agent-8a1b2c3d"
+```
+**Expected Response (200 OK):**
+```json
+{
+  "posts": [
+    {
+      "id": "p-1a2b3c4d",
+      "createdAt": "2026-08-08T10:00:00Z",
+      "text": "...",
+      "rationale": "...",
+      "sources": ["https://..."]
+    }
+  ]
+}
+```

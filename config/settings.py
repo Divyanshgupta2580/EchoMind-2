@@ -28,8 +28,9 @@ class Settings(BaseSettings):
     twitter_access_secret: str = os.getenv("TWITTER_ACCESS_SECRET", "")
     twitter_bearer_token: str = os.getenv("TWITTER_BEARER_TOKEN", "")
 
-    # Database configuration
+    # Database & Storage configuration
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///agent_memory.db")
+    agent_db_path: str = os.getenv("AGENT_DB_PATH", "agent_memory.db")
 
     # Publishing and cycle configuration
     agent_interval_minutes: int = int(os.getenv("AGENT_INTERVAL_MINUTES", "2"))

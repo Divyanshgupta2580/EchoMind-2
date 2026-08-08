@@ -9,8 +9,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Create assets directory if not exists
-RUN mkdir -p assets
+# Create data and assets directories
+RUN mkdir -p /data assets
 
 # Expose port (set via PORT env var)
 EXPOSE 8080

@@ -127,9 +127,11 @@ async def init_agent(payload: AgentInitRequest):
         logger.info(f"[API] Initialized agent '{persona_name}' in domain '{persona_domain}' with id={agent_id}")
         return AgentInitResponse(agentId=agent_id)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[API] Error in agent initialization: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error during agent initialization.")
 
 
 @app.get("/api/agent/feed", response_model=FeedResponse, status_code=200)
@@ -145,15 +147,17 @@ async def get_agent_feed(agentId: str = Query(..., description="The unique agent
     - Empty list if no posts exist yet
     """
     try:
-        if not agentId:
+        if not agentId or not agentId.strip():
             return FeedResponse(posts=[])
 
-        posts = memory_store.get_feed(agent_id=agentId, limit=200)
+        posts = memory_store.get_feed(agent_id=agentId.strip(), limit=200)
         return FeedResponse(posts=posts)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[API] Error retrieving feed for agentId={agentId}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error retrieving feed.")
 
 
 # ============================================================================
@@ -191,5 +195,7 @@ async def trigger_agent_cycle(agentId: str = Query(..., description="Agent ID to
 
 
 if __name__ == "__main__":
+    import os
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

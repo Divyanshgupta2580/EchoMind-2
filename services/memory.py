@@ -33,9 +33,20 @@ class AgentMemoryStore:
 
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
+        self._ensure_parent_dir()
         self._init_db()
 
+    def _ensure_parent_dir(self) -> None:
+        """Ensure parent directory exists for configured database path."""
+        try:
+            parent_dir = Path(self.db_path).parent
+            if str(parent_dir) not in ("", "."):
+                parent_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"[MEMORY] Could not create parent directory for {self.db_path}: {e}")
+
     def _get_connection(self) -> sqlite3.Connection:
+        self._ensure_parent_dir()
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         # Enable WAL mode for high concurrency

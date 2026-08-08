@@ -35,6 +35,15 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Local SQLite databases & journals
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+agent_memory.db
+
 # Build
 dist/
 build/
