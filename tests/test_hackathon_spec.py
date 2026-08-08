@@ -13,7 +13,7 @@ Comprehensive tests covering:
 9. Evaluator API endpoints: POST /api/agent/init, GET /api/agent/feed, GET /api/agent/status, GET /healthz, GET /api/agents.
 10. CRIT-001 Atomic CAS window-close lock under concurrent invocations.
 11. CRIT-002 Non-open windows (PUBLISHED, NO_QUALIFIED_STORY) cannot be re-closed.
-12. HIGH-001 Safe X retries, persistent SQLite idempotency, and 403 duplicate reconciliation.
+12. X Publisher: Real response handling, generic 403 failure rejection without synthetic IDs, structured duplicate detection, and persistent idempotency.
 13. HIGH-002 Per-agent asyncio.Lock preventing scheduler cycle overlap.
 14. MAX_AGENTS=5 Server-side atomic FIFO rotation and dependent data cleanup.
 15. Dynamic Configuration: PUBLISH_WINDOW_MINUTES (10 vs 120) and MIN_NEWS_SCORE=75.0.
@@ -24,16 +24,16 @@ import os
 import re
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
-from fastapi.testclient import TestClient
-
+from datetime import datetime, timedelta
 from config.persona_engine import build_persona_profile
 from config.settings import Settings, settings
 from main import app
 from services.autonomous_publisher import AutonomousPublisherService
 from services.editorial_engine import EditorialEngine
+from services.llm import LLMClient
 from services.memory import AgentMemoryStore
-from services.twitter import MockXPublisher, XPublisher
+from services.twitter import MockXPublisher, XPublisher, is_explicit_duplicate_error
+from fastapi.testclient import TestClient
 
 client = TestClient(app)
 ISO_8601_REGEX = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
@@ -475,48 +475,407 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
         self.assertEqual(len(self.mock_publisher.published_posts), 1)
 
     # =========================================================================
-    # 8. HIGH-001: X PUBLISHER RETRIES, IDEMPOTENCY & DUPLICATE CONTENT RECOVERY
+    # 8. X PUBLISHER: REAL RESPONSE, 403 REJECTION, AND STRUCTURED DUPLICATE HANDLING
     # =========================================================================
 
-    def test_high_001_x_retry_duplicate_content_recovery(self):
-        """
-        HIGH-001: If Tweepy/X reports a 403 Duplicate Content on retry
-        (because the initial network attempt reached X but the client timed out),
-        XPublisher reconciles the post as PUBLISHED and prevents FAILED state.
-        """
-        class DuplicateFailingClient:
-            def __init__(self):
-                self.calls = 0
+    def test_x_real_successful_response_returns_genuine_post_id(self):
+        """TEST 1: Real successful X response with genuine post ID."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
 
+        class MockTweetRes:
+            data = {"id": "1888123456789012345"}
+
+        class SuccessfulClient:
+            def get_me(self):
+                return MockUserRes()
             def create_tweet(self, text):
-                self.calls += 1
-                if self.calls == 1:
-                    raise Exception("ConnectionResetError: Connection lost before response")
-                raise Exception("403 Forbidden: You are not allowed to create a tweet with duplicate content.")
+                return MockTweetRes()
+            def get_tweet(self, id):
+                return MockTweetRes()
 
         x_pub = XPublisher(
-            api_key="mock-key",
-            api_secret="mock-sec",
-            access_token="mock-tok",
-            access_token_secret="mock-tok-sec",
-            max_retries=2,
+            api_key="k", api_secret="s", access_token="t", access_token_secret="ts",
             memory_store=self.memory
         )
-        x_pub._client = DuplicateFailingClient()
+        x_pub._client = SuccessfulClient()
 
         result = asyncio.run(x_pub.publish_post(
-            text="Breaking: CVE-2026-10492 published on adversarial weights.",
-            metadata={"idempotency_key": "k-dup-test", "agent_id": "a-dup", "window_id": "w-dup"}
+            text="Breaking: CVE-2026-10492 published.",
+            metadata={"idempotency_key": "k-real-success", "agent_id": "a-1", "window_id": "w-1"}
         ))
 
         self.assertTrue(result["success"])
         self.assertEqual(result["status"], "PUBLISHED")
-        self.assertTrue(result.get("is_duplicate"))
-        self.assertTrue(result.get("reconciled"))
+        self.assertEqual(result["post_id"], "1888123456789012345")
+        self.assertIsNone(result.get("error"))
 
-        # Verify persistent record in SQLite
-        rec = self.memory.get_x_publication_record("k-dup-test")
-        self.assertIsNotNone(rec)
+    # =========================================================================
+    # 12. PHASE 3 - COMPREHENSIVE X PUBLICATION INTEGRITY & VERIFICATION TESTS
+    # =========================================================================
+
+    def test_authenticated_x_account_matches_expected_handle(self):
+        """TEST 1: Authenticated X account matches EXPECTED_X_HANDLE."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class ClientWithMatchingUser:
+            def get_me(self):
+                return MockUserRes()
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = ClientWithMatchingUser()
+
+        import os
+        old_val = os.environ.get("EXPECTED_X_HANDLE")
+        os.environ["EXPECTED_X_HANDLE"] = "RASBASRYPI"
+        try:
+            res = x_pub.verify_authenticated_account()
+            self.assertTrue(res["success"])
+            self.assertEqual(res["handle"], "RASBASRYPI")
+        finally:
+            if old_val is not None:
+                os.environ["EXPECTED_X_HANDLE"] = old_val
+            else:
+                os.environ.pop("EXPECTED_X_HANDLE", None)
+
+    def test_authenticated_x_account_mismatch_fails_closed(self):
+        """TEST 2: Authenticated X account handle mismatch fails closed immediately."""
+        class MockUserRes:
+            data = {"username": "wrong_user_handle"}
+
+        class ClientWithWrongUser:
+            def get_me(self):
+                return MockUserRes()
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = ClientWithWrongUser()
+
+        import os
+        old_val = os.environ.get("EXPECTED_X_HANDLE")
+        os.environ["EXPECTED_X_HANDLE"] = "RASBASRYPI"
+        try:
+            res = asyncio.run(x_pub.publish_post(text="Test text", metadata={"idempotency_key": "k-mismatch"}))
+            self.assertFalse(res["success"])
+            self.assertEqual(res["status"], "FAILED")
+            self.assertIn("does not match expected handle", str(res.get("error")))
+        finally:
+            if old_val is not None:
+                os.environ["EXPECTED_X_HANDLE"] = old_val
+            else:
+                os.environ.pop("EXPECTED_X_HANDLE", None)
+
+    def test_get_me_failure_fails_closed(self):
+        """TEST 3: client.get_me() failure fails closed immediately."""
+        class FailingGetMeClient:
+            def get_me(self):
+                raise Exception("401 Unauthorized: Could not authenticate get_me()")
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = FailingGetMeClient()
+
+        res = asyncio.run(x_pub.publish_post(text="Test text get_me fail", metadata={"idempotency_key": "k-getme-fail"}))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+        self.assertIsNone(res.get("post_id"))
+
+    def test_genuine_create_tweet_followed_by_successful_get_tweet_verification(self):
+        """TEST 4: Genuine create_tweet followed by successful independent get_tweet verification yields PUBLISHED."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class MockTweetRes:
+            data = {"id": "1888123456789012345"}
+
+        class VerifiedClient:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                class MockRes:
+                    data = {"id": "1888123456789012345"}
+                return MockRes()
+            def get_tweet(self, id):
+                return MockTweetRes()
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = VerifiedClient()
+
+        res = asyncio.run(x_pub.publish_post(text="Genuine verified post text", metadata={"idempotency_key": "k-verified-success"}))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "PUBLISHED")
+        self.assertEqual(res["post_id"], "1888123456789012345")
+
+    def test_create_tweet_returns_numeric_id_but_get_tweet_cannot_find_it(self):
+        """TEST 5: create_tweet returns numeric ID but independent get_tweet verification finds no data."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class UnverifiableClient:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                class MockRes:
+                    data = {"id": "1888123456789012345"}
+                return MockRes()
+            def get_tweet(self, id):
+                return None  # GET /2/tweets/1888123456789012345 returns no data
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = UnverifiableClient()
+
+        res = asyncio.run(x_pub.publish_post(text="Test text unverifiable", metadata={"idempotency_key": "k-unverifiable"}))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+        self.assertIsNone(res.get("post_id"))
+
+    def test_get_tweet_returns_mismatching_id(self):
+        """TEST 6: get_tweet returns a mismatching ID."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class MockMismatchingTweetRes:
+            data = {"id": "9999999999999999999"}
+
+        class MismatchingClient:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                class MockRes:
+                    data = {"id": "1888123456789012345"}
+                return MockRes()
+            def get_tweet(self, id):
+                return MockMismatchingTweetRes()
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = MismatchingClient()
+
+        res = asyncio.run(x_pub.publish_post(text="Test text mismatch", metadata={"idempotency_key": "k-mismatch-id"}))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+        self.assertIsNone(res.get("post_id"))
+
+    def test_create_tweet_returns_no_id(self):
+        """TEST 7: create_tweet returns response missing data.id."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class NoIdClient:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                return None
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = NoIdClient()
+
+        res = asyncio.run(x_pub.publish_post(text="Test text no id", metadata={"idempotency_key": "k-no-id"}))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+        self.assertIsNone(res.get("post_id"))
+
+    def test_generic_401_unauthorized(self):
+        """TEST 8: Generic HTTP 401 Unauthorized fails cleanly."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class Client401:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                raise Exception("401 Unauthorized: Could not authenticate credentials.")
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = Client401()
+
+        res = asyncio.run(x_pub.publish_post(text="Test text 401", metadata={"idempotency_key": "k-401"}))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+
+    def test_generic_403_forbidden(self):
+        """TEST 9: Generic HTTP 403 Forbidden fails cleanly without retries."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class Client403:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                raise Exception("403 Forbidden: Read-only app scope limit.")
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = Client403()
+
+        res = asyncio.run(x_pub.publish_post(text="Test text 403", metadata={"idempotency_key": "k-403"}))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+
+    def test_explicit_duplicate_error_without_sqlite_id(self):
+        """TEST 10: Explicit duplicate error without pre-existing SQLite Snowflake ID fails cleanly."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class ClientDup:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                raise Exception("403 Forbidden: Status is a duplicate.")
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        x_pub._client = ClientDup()
+
+        res = asyncio.run(x_pub.publish_post(text="Test duplicate text", metadata={"idempotency_key": "k-dup-no-id"}))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+
+    def test_network_timeout_after_x_may_have_accepted_tweet(self):
+        """TEST 11: Network timeout during create_tweet fails cleanly without fabricating IDs."""
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class ClientTimeout:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                raise ConnectionError("Network unreachable: connection timed out")
+
+        x_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", max_retries=2, memory_store=self.memory)
+        x_pub._client = ClientTimeout()
+
+        res = asyncio.run(x_pub.publish_post(text="Network timeout test", metadata={"idempotency_key": "k-timeout"}))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "FAILED")
+
+    def test_synthetic_x_mock_id_rejected(self):
+        """TEST 12: Synthetic x-mock-* ID is rejected by production publication gate."""
+        prod_service = AutonomousPublisherService(memory=self.memory)
+        async def mock_fake_publish(*args, **kwargs):
+            return {"success": True, "status": "PUBLISHED", "post_id": "x-mock-0001"}
+        prod_service.publisher.publish_post = mock_fake_publish
+
+        agent_id = "agent-test-x-mock-gate-p3"
+        self.memory.register_agent(agent_id, "Ada", "AI Security")
+        window = self.memory.create_window(agent_id, duration_minutes=120)
+        window_id = window["window_id"]
+        self.memory.save_candidate("c-gate-p3-1", agent_id, window_id, "Title", "Summary", ["https://a.org"], "High", 90.0, {"total": 90.0}, "LEADER")
+
+        res = asyncio.run(prod_service.process_window_close(agent_id, window_id))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["window_status"], "FAILED")
+
+    def test_synthetic_x_confirmed_id_rejected(self):
+        """TEST 13: Synthetic x-confirmed-* ID is rejected by production publication gate."""
+        prod_service = AutonomousPublisherService(memory=self.memory)
+        async def mock_confirmed_publish(*args, **kwargs):
+            return {"success": True, "status": "PUBLISHED", "post_id": "x-confirmed-agent-1c"}
+        prod_service.publisher.publish_post = mock_confirmed_publish
+
+        agent_id = "agent-test-x-conf-gate-p3"
+        self.memory.register_agent(agent_id, "Ada", "AI Security")
+        window = self.memory.create_window(agent_id, duration_minutes=120)
+        window_id = window["window_id"]
+        self.memory.save_candidate("c-gate-p3-2", agent_id, window_id, "Title 2", "Summary 2", ["https://a.org"], "High", 91.0, {"total": 91.0}, "LEADER")
+
+        res = asyncio.run(prod_service.process_window_close(agent_id, window_id))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["window_status"], "FAILED")
+
+    def test_successful_publication_database_state(self):
+        """TEST 14: Successful genuine publication updates DB (1 feed row, candidate PUBLISHED, Snowflake ID stored)."""
+        agent_id = "agent-test-success-p3-db"
+        self.memory.register_agent(agent_id, "Ada", "AI Security")
+        window = self.memory.create_window(agent_id, duration_minutes=120)
+        window_id = window["window_id"]
+
+        self.memory.save_candidate("c-succ-p3", agent_id, window_id, "Success Title", "Success Summary", ["https://a.org"], "High", 95.0, {"total": 95.0}, "LEADER")
+
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class MockTweetRes:
+            data = {"id": "1999888777666555444"}
+
+        class GenuineVerifiedClient:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                class MockRes:
+                    data = {"id": "1999888777666555444"}
+                return MockRes()
+            def get_tweet(self, id):
+                return MockTweetRes()
+
+        genuine_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        genuine_pub._client = GenuineVerifiedClient()
+        success_service = AutonomousPublisherService(memory=self.memory, publisher=genuine_pub)
+
+        res = asyncio.run(success_service.process_window_close(agent_id, window_id))
+        self.assertTrue(res["success"])
+        self.assertEqual(res["window_status"], "PUBLISHED")
+        self.assertEqual(self.memory.count_posts(agent_id), 1)
+        cands = self.memory.get_candidates_for_window(window_id)
+        self.assertEqual(cands[0]["status"], "PUBLISHED")
+        self.assertEqual(self.memory.get_window(window_id)["status"], "PUBLISHED")
+        self.assertEqual(self.memory.get_window(window_id)["post_id"], "1999888777666555444")
+
+    def test_failed_publication_database_state(self):
+        """TEST 15: Failed publication leaves DB clean (0 feed rows, candidate NOT PUBLISHED, window FAILED)."""
+        agent_id = "agent-test-failed-p3-db"
+        self.memory.register_agent(agent_id, "Ada", "AI Security")
+        window = self.memory.create_window(agent_id, duration_minutes=120)
+        window_id = window["window_id"]
+
+        self.memory.save_candidate("c-fail-p3", agent_id, window_id, "Fail Title", "Fail Summary", ["https://a.org"], "High", 95.0, {"total": 95.0}, "LEADER")
+
+        failing_pub = MockXPublisher(should_fail=True)
+        fail_service = AutonomousPublisherService(memory=self.memory, publisher=failing_pub)
+
+        res = asyncio.run(fail_service.process_window_close(agent_id, window_id))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["window_status"], "FAILED")
+        self.assertEqual(self.memory.count_posts(agent_id), 0)
+        cands = self.memory.get_candidates_for_window(window_id)
+        self.assertNotEqual(cands[0]["status"], "PUBLISHED")
+        self.assertEqual(self.memory.get_window(window_id)["status"], "FAILED")
+
+    def test_production_service_construction_never_uses_mock_publisher(self):
+        """TEST 16: AutonomousPublisherService() without args strictly instantiates production XPublisher."""
+        service = AutonomousPublisherService(memory=self.memory)
+        self.assertIsInstance(service.publisher, XPublisher)
+        self.assertNotIsInstance(service.publisher, MockXPublisher)
+
+    def test_process_window_close_never_marks_published_before_independent_x_verification(self):
+        """TEST 17: process_window_close never marks PUBLISHED if independent GET tweet verification fails."""
+        agent_id = "agent-test-unverified-close"
+        self.memory.register_agent(agent_id, "Ada", "AI Security")
+        window = self.memory.create_window(agent_id, duration_minutes=120)
+        window_id = window["window_id"]
+
+        self.memory.save_candidate("c-unverified", agent_id, window_id, "Unverified Title", "Unverified Summary", ["https://a.org"], "High", 95.0, {"total": 95.0}, "LEADER")
+
+        class MockUserRes:
+            data = {"username": "RASBASRYPI"}
+
+        class FailingGetTweetClient:
+            def get_me(self):
+                return MockUserRes()
+            def create_tweet(self, text):
+                class MockRes:
+                    data = {"id": "1888123456789012345"}
+                return MockRes()
+            def get_tweet(self, id):
+                return None  # Independent GET verification returns no data
+
+        unverified_pub = XPublisher(api_key="k", api_secret="s", access_token="t", access_token_secret="ts", memory_store=self.memory)
+        unverified_pub._client = FailingGetTweetClient()
+        unverified_service = AutonomousPublisherService(memory=self.memory, publisher=unverified_pub)
+
+        res = asyncio.run(unverified_service.process_window_close(agent_id, window_id))
+        self.assertFalse(res["success"])
+        self.assertEqual(res["window_status"], "FAILED")
+        self.assertEqual(self.memory.count_posts(agent_id), 0)
+        cands = self.memory.get_candidates_for_window(window_id)
+        self.assertNotEqual(cands[0]["status"], "PUBLISHED")
+        self.assertEqual(self.memory.get_window(window_id)["status"], "FAILED")
 
     # =========================================================================
     # 9. HIGH-002: SCHEDULER DISCOVERY CONCURRENCY LOCK
@@ -685,6 +1044,76 @@ class TestEchoMindNewsPublisher(unittest.TestCase):
 
         # 7. Centralized API Base URL Configuration
         self.assertEqual(settings.api_base_url, "https://echomind-ltwo.onrender.com")
+
+    # =========================================================================
+    # 13. LLM CLIENT STRUCTURED GENERATION CONTRACT TEST
+    # =========================================================================
+
+    def test_llm_client_generate_structured_contract(self):
+        """
+        Verify that LLMClient.generate_structured accepts both 'schema=' and 'response_format='
+        keyword arguments as well as positional arguments without raising TypeError.
+        """
+        class MockHttpResponse:
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"post_text": "Verified security flaw in AI weights.", "rationale": "High score", "sources": ["https://arxiv.org"]}'
+                            }
+                        }
+                    ]
+                }
+
+        class MockAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def post(self, url, headers=None, json=None):
+                if not json or "response_format" not in json:
+                    raise ValueError("Missing response_format in LLM request payload")
+                return MockHttpResponse()
+
+        llm = LLMClient()
+
+        import httpx
+        original_client = httpx.AsyncClient
+        httpx.AsyncClient = MockAsyncClient
+
+        try:
+            schema = {"type": "json_schema", "json_schema": {"name": "test", "schema": {}}}
+
+            # 1. Test schema= keyword argument (used by editorial_engine)
+            res1 = asyncio.run(llm.generate_structured(
+                system="sys",
+                user="usr",
+                schema=schema
+            ))
+            self.assertIn("post_text", res1)
+
+            # 2. Test response_format= keyword argument (used by topic_discovery)
+            res2 = asyncio.run(llm.generate_structured(
+                system="sys",
+                user="usr",
+                response_format=schema
+            ))
+            self.assertIn("post_text", res2)
+
+            # 3. Test 3rd positional argument (used by mentions)
+            res3 = asyncio.run(llm.generate_structured(
+                "sys",
+                "usr",
+                schema
+            ))
+            self.assertIn("post_text", res3)
+        finally:
+            httpx.AsyncClient = original_client
 
 
 if __name__ == "__main__":

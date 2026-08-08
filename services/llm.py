@@ -66,9 +66,17 @@ class LLMClient:
         self,
         system: str,
         user: str,
-        response_format: dict[str, Any]
+        response_format: dict[str, Any] | None = None,
+        schema: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Generate structured JSON output with schema enforcement and resilient parsing."""
+        """
+        Generate structured JSON output with schema enforcement and resilient parsing.
+        Accepts either `response_format` or `schema` as the JSON schema parameter.
+        """
+        target_schema = response_format if response_format is not None else schema
+        if target_schema is None:
+            raise ValueError("generate_structured requires a 'response_format' or 'schema' dictionary parameter")
+
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
@@ -83,7 +91,7 @@ class LLMClient:
                         "model": self.model,
                         "messages": messages,
                         "max_tokens": 1200,
-                        "response_format": response_format
+                        "response_format": target_schema
                     }
                 )
                 response.raise_for_status()

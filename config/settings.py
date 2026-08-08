@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     x_access_token: str = os.getenv("X_ACCESS_TOKEN", os.getenv("TWITTER_ACCESS_TOKEN", ""))
     x_access_token_secret: str = os.getenv("X_ACCESS_TOKEN_SECRET", os.getenv("TWITTER_ACCESS_SECRET", ""))
     x_bearer_token: str = os.getenv("X_BEARER_TOKEN", os.getenv("TWITTER_BEARER_TOKEN", ""))
+    x_expected_handle: str = os.getenv("EXPECTED_X_HANDLE", os.getenv("X_EXPECTED_HANDLE", ""))
 
     # Backwards-compatible aliases
     twitter_api_key: str = os.getenv("TWITTER_API_KEY", os.getenv("X_API_KEY", ""))

@@ -27,6 +27,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import re
 from config.persona_engine import build_persona_profile
 from config.settings import settings
 from services.editorial_engine import EditorialEngine
@@ -34,7 +35,7 @@ from services.llm import LLMClient
 from services.memory import AgentMemoryStore, memory_store
 from services.publisher_interface import IXPublisher
 from services.topic_discovery import TopicDiscoveryService
-from services.twitter import MockXPublisher, XPublisher
+from services.twitter import MockXPublisher, XPublisher, is_valid_x_post_id
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +58,12 @@ class AutonomousPublisherService:
         self.editorial = EditorialEngine(self.llm, self.memory)
         self._agent_locks: dict[str, asyncio.Lock] = {}
         
-        # Configure X publisher; default to XPublisher with memory_store, fallback to MockXPublisher if credentials unset
+        # Configure X publisher: default strictly to production XPublisher.
+        # NEVER fall back to MockXPublisher in production when credentials are missing!
         if publisher is not None:
             self.publisher = publisher
-        elif settings.x_api_key and settings.x_api_secret and settings.x_access_token and settings.x_access_token_secret:
-            self.publisher = XPublisher(memory_store=self.memory)
         else:
-            logger.info("[PUBLISHER] X credentials not detected; using MockXPublisher for safe execution.")
-            self.publisher = MockXPublisher()
+            self.publisher = XPublisher(memory_store=self.memory)
 
     def _get_agent_lock(self, agent_id: str) -> asyncio.Lock:
         """Get or create an asyncio.Lock for a specific agent to prevent cycle overlap."""
@@ -246,7 +245,14 @@ class AutonomousPublisherService:
             }
         )
 
-        if pub_result["success"]:
+        # Gate publication state transitions on verified genuine publication
+        raw_post_id = pub_result.get("post_id")
+        is_genuine_publication = (
+            pub_result.get("success") is True
+            and is_valid_x_post_id(raw_post_id)
+        )
+
+        if is_genuine_publication:
             # Persist to feed_posts table
             saved_post = self.memory.save_post(
                 agent_id=agent_id,
@@ -254,23 +260,23 @@ class AutonomousPublisherService:
                 rationale=post_data["rationale"],
                 sources=post_data["sources"],
                 topic_hash=post_data["topic_hash"],
-                post_id=pub_result.get("post_id")
+                post_id=raw_post_id
             )
             self.memory.update_candidate_status(leader["candidate_id"], "PUBLISHED")
             self.memory.close_window(
                 window_id=window_id,
                 status="PUBLISHED",
                 selected_candidate_id=leader["candidate_id"],
-                post_id=pub_result.get("post_id")
+                post_id=raw_post_id
             )
             self.memory.save_x_publication_record(
                 idempotency_key=idempotency_key,
-                post_id=pub_result.get("post_id") or "pub-confirmed",
+                post_id=raw_post_id,
                 text=post_data["text"],
                 agent_id=agent_id,
                 window_id=window_id
             )
-            logger.info(f"[X] Published successfully! Post ID: {pub_result.get('post_id')}")
+            logger.info(f"[X] Published successfully! Post ID: {raw_post_id}")
 
             # Open next 2-hour window
             new_window = self.memory.create_window(agent_id, duration_minutes=settings.publish_window_minutes)
@@ -283,7 +289,8 @@ class AutonomousPublisherService:
                 "next_window_id": new_window["window_id"]
             }
         else:
-            logger.error(f"[X] Failed to publish post: {pub_result.get('error')}")
+            err_msg = pub_result.get("error") or f"Invalid or synthetic publication ID: {raw_post_id}"
+            logger.error(f"[X] Failed to publish post: {err_msg}")
             self.memory.close_window(
                 window_id=window_id,
                 status="FAILED",
@@ -294,7 +301,7 @@ class AutonomousPublisherService:
                 "success": False,
                 "action": "publish_failed",
                 "window_status": "FAILED",
-                "error": pub_result.get("error"),
+                "error": err_msg,
                 "closed_window_id": window_id,
                 "next_window_id": new_window["window_id"]
             }
