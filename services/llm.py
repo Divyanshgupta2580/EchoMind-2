@@ -302,8 +302,6 @@ class LLMClient:
             payload["generationConfig"]["responseMimeType"] = "application/json"
             if target_schema:
                 payload["generationConfig"]["responseSchema"] = target_schema.get("json_schema", {}).get("schema", target_schema)
-        if target_schema:
-            payload["response_format"] = target_schema
 
         async with httpx.AsyncClient(timeout=45.0) as client:
             response = await client.post(url, json=payload)

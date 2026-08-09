@@ -17,9 +17,10 @@ import logging
 import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,8 @@ class AgentMemoryStore:
         except Exception as e:
             logger.warning(f"[MEMORY] Could not create parent directory for {self.db_path}: {e}")
 
-    def _get_connection(self) -> sqlite3.Connection:
+    @contextmanager
+    def _get_connection(self) -> Generator[sqlite3.Connection, None, None]:
         self._ensure_parent_dir()
         conn = sqlite3.connect(self.db_path, timeout=15, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -55,7 +57,10 @@ class AgentMemoryStore:
         conn.execute("PRAGMA journal_mode=WAL;")
         # SQLite-level busy timeout (ms) — retry internally before raising "database is locked"
         conn.execute("PRAGMA busy_timeout=15000;")
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize database schema."""

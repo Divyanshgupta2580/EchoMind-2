@@ -7,6 +7,9 @@ from services.llm import _validate_structured_response
 
 
 class InjectingLLM:
+    async def generate(self, system="", user=""):
+        return '{"is_duplicate": false, "matched_post": null}'
+
     async def generate_structured(self, **kwargs):
         return {
             "post_text": "Verified source integrity must survive generation.",
