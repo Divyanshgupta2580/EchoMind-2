@@ -8,7 +8,7 @@ FastAPI application providing:
 - GET /api/agent/feed: Fetch reverse-chronological feed with rationale and sources
 - GET /api/agent/status: Real-time window, leader, candidate count, and publication status
 - GET /health and GET /healthz: Lightweight health check endpoints
-- 5-Minute continuous background discovery and configuration-driven publishing window scheduling via APScheduler
+- ~35-Minute background discovery with ±5-min jitter and configuration-driven publishing window scheduling via APScheduler
 """
 
 import asyncio
@@ -43,12 +43,15 @@ scheduler = AsyncIOScheduler()
 
 # Request / Response Schemas for Hackathon API Specification
 class PersonaInitPayload(BaseModel):
-    name: str = Field(..., description="Human-readable agent persona identity (e.g. 'Ada')")
-    domain: str = Field(..., description="Technical domain specialization (e.g. 'AI Security')")
+    name: str | None = Field(None, description="Human-readable agent persona identity (e.g. 'Ada')")
+    domain: str | None = Field(None, description="Technical domain specialization (e.g. 'AI Security')")
 
 
 class AgentInitRequest(BaseModel):
-    persona: PersonaInitPayload
+    persona: PersonaInitPayload | None = None
+    name: str | None = None
+    domain: str | None = None
+    agent_name: str | None = None
 
 
 class AgentInitResponse(BaseModel):
@@ -114,20 +117,29 @@ async def lifespan(app: FastAPI):
 
     # Start the background task scheduler
     if not scheduler.running:
-        # Schedule periodic background discovery and evaluation loop (every ~5 minutes)
+        # Schedule periodic background discovery and evaluation loop (~35 min + jitter)
         # Governed by publishing windows in AutonomousPublisherService
         # HIGH-002: max_instances=1 and coalesce=True prevents overlapping job execution
+        # Jitter adds ±N seconds of randomized offset to each cycle to prevent
+        # API spiking and simulate a natural publishing cadence.
+        jitter = settings.discovery_jitter_seconds  # default: 300s (±5 min)
         scheduler.add_job(
             publisher_service.run_all_agents_cycle,
             "interval",
             minutes=settings.discovery_interval_minutes,
+            jitter=jitter,
             id="autonomous_publishing_cycle",
             max_instances=1,
             coalesce=True,
-            misfire_grace_time=60
+            misfire_grace_time=120
         )
         scheduler.start()
-        logger.info(f"[APP] Background autonomous discovery scheduler started successfully (interval: {settings.discovery_interval_minutes} min, window: {settings.publish_window_minutes} min).")
+        logger.info(
+            f"[APP] Background autonomous discovery scheduler started "
+            f"(interval: {settings.discovery_interval_minutes} min, "
+            f"jitter: ±{jitter}s, "
+            f"window: {settings.publish_window_minutes} min)."
+        )
 
     yield
 
@@ -140,7 +152,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Autonomous AI & Technology Persona News Publisher",
-    description="Quality-driven autonomous news publisher with 5-minute discovery loops and configuration-driven publishing windows",
+    description="Quality-driven autonomous news publisher with ~35-min discovery loops (±5-min jitter) and configuration-driven publishing windows",
     version="3.0.0",
     lifespan=lifespan
 )
@@ -202,13 +214,24 @@ async def init_agent(payload: AgentInitRequest):
     atomically evicts the oldest agent and all owned records.
     Generates a unique machine identifier (agentId), registers in SQLite memory,
     creates the initial publishing window, and triggers background discovery.
+
+    Strictly returns: {"agentId": "abc-123"}
     """
     try:
-        persona_name = payload.persona.name.strip()
-        persona_domain = payload.persona.domain.strip()
+        persona_name = ""
+        persona_domain = ""
+        if payload.persona:
+            persona_name = (payload.persona.name or "").strip()
+            persona_domain = (payload.persona.domain or "").strip()
+        if not persona_name:
+            persona_name = (payload.name or payload.agent_name or "").strip()
+        if not persona_domain:
+            persona_domain = (payload.domain or "").strip()
 
-        if not persona_name or not persona_domain:
-            raise HTTPException(status_code=400, detail="Persona name and domain must not be empty.")
+        if not persona_name:
+            persona_name = "Autonomous Persona"
+        if not persona_domain:
+            persona_domain = "AI & Technology"
 
         # Generate unique machine agentId (e.g. agent-8a1b2c3d)
         agent_id = f"agent-{uuid.uuid4().hex[:8]}"
@@ -248,23 +271,22 @@ async def delete_single_agent(agent_id: str):
 
 
 @app.get("/api/agent/feed", response_model=FeedResponse, status_code=200)
-async def get_agent_feed(agentId: str = Query(..., description="The unique agent identifier returned during initialization")):
+@app.get("/api/feed", response_model=FeedResponse, status_code=200, include_in_schema=False)
+@app.get("/feed", response_model=FeedResponse, status_code=200, include_in_schema=False)
+async def get_agent_feed(agentId: str | None = Query(None, description="The unique agent identifier returned during initialization")):
     """
-    Get the published feed for a given agent.
+    Get the published feed for a given agent (or all published posts if agentId not provided).
 
-    Returns:
-    - Reverse chronological order (newest first)
-    - ISO 8601 UTC timestamps
-    - Unique post IDs
-    - Transparent editorial rationales and source citation URLs
-    - Empty list if no posts exist yet
+    Strict API Contract:
+    - createdAt MUST be an ISO 8601 UTC string (e.g. '2026-08-07T10:30:00Z')
+    - sources MUST be an array of strings
+    - Sorted newest first (ORDER BY created_at DESC)
+    - If DB is empty, MUST return {"posts": []} with status 200 OK
     """
     try:
-        if not agentId or not agentId.strip():
-            return FeedResponse(posts=[])
-
-        posts = memory_store.get_feed(agent_id=agentId.strip(), limit=200)
-        return FeedResponse(posts=posts)
+        clean_id = agentId.strip() if (agentId and isinstance(agentId, str)) else None
+        posts = memory_store.get_feed(agent_id=clean_id, limit=200)
+        return FeedResponse(posts=posts if posts is not None else [])
 
     except HTTPException:
         raise

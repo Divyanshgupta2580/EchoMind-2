@@ -72,23 +72,33 @@ async def web_search(query: str, **kwargs) -> str:
         message = data["choices"][0]["message"]
         content = message.get("content", "")
 
-        # Extract source citations from annotations
-        sources = []
+        # 1. Extract source citations from OpenRouter annotations
+        sources: list[str] = []
         for annotation in message.get("annotations", []):
             if annotation.get("type") == "url_citation":
                 citation = annotation.get("url_citation", {})
                 url = citation.get("url") or citation.get("title") or ""
-                if url:
-                    sources.append(url)
+                if url and isinstance(url, str) and url.startswith("http"):
+                    if url not in sources:
+                        sources.append(url.strip())
 
-        # Fallback: extract URLs from markdown or text if annotations were omitted
-        if not sources:
-            urls = re.findall(r'https?://[^\s)\]">]+', content)
-            sources = list(dict.fromkeys(urls))[:5]
+        # 2. Extract HTTP/HTTPS URLs from content markdown/text
+        urls_in_content = re.findall(r'https?://[^\s)\]">]+', content)
+        for u in urls_in_content:
+            clean_u = u.rstrip(".,;:")
+            if clean_u.startswith("http") and clean_u not in sources:
+                sources.append(clean_u)
 
-        logger.info(f"[WEB_SEARCH] Completed: {len(sources)} sources found")
+        logger.info(f"[WEB_SEARCH] Search completed: {len(sources)} unique source URL(s) extracted")
 
-        return f"Search results:\n{content}\n\nSources: {len(sources)}\n" + "\n".join(sources)
+        # Format output with clear demarcation of text and discovered URLs
+        sources_block = "\n".join([f"- {s}" for s in sources]) if sources else "- (No external URLs extracted)"
+        return (
+            f"=== LIVE SEARCH RESULTS ===\n"
+            f"{content}\n\n"
+            f"=== EXTRACTED SOURCE URLS ===\n"
+            f"{sources_block}\n"
+        )
 
     except httpx.TimeoutException:
         logger.error(f"[WEB_SEARCH] Timeout after 60s")

@@ -1,7 +1,5 @@
 """
-Utility modules for Twitter Agent Bot.
-
-Contains shared functionality used across services and tools.
+Utility modules for EchoMind Autonomous Persona News Publisher.
 """
 
 from utils.api import OPENROUTER_URL, get_openrouter_headers

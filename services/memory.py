@@ -49,10 +49,12 @@ class AgentMemoryStore:
 
     def _get_connection(self) -> sqlite3.Connection:
         self._ensure_parent_dir()
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, timeout=15, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        # Enable WAL mode for high concurrency
+        # Enable WAL mode for high concurrency (concurrent readers + single writer)
         conn.execute("PRAGMA journal_mode=WAL;")
+        # SQLite-level busy timeout (ms) — retry internally before raising "database is locked"
+        conn.execute("PRAGMA busy_timeout=15000;")
         return conn
 
     def _init_db(self) -> None:
@@ -369,35 +371,59 @@ class AgentMemoryStore:
                     }
                 return None
 
-    def get_feed(self, agent_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    def get_feed(self, agent_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         """
         Get posts in reverse chronological order (newest first).
-        Returns list of posts with id, createdAt (ISO 8601 UTC), text, rationale, sources.
+        Returns list of posts with id, createdAt (ISO 8601 UTC string), text, rationale, sources (list of strings).
+        If agent_id is None, returns posts across all agents.
+        If no posts exist, returns an empty list [].
         """
         with self._get_connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, created_at, text, rationale, sources_json 
-                FROM feed_posts 
-                WHERE agent_id = ? 
-                ORDER BY created_at DESC 
-                LIMIT ?
-                """,
-                (agent_id, limit)
-            ).fetchall()
+            if agent_id:
+                rows = conn.execute(
+                    """
+                    SELECT id, created_at, text, rationale, sources_json 
+                    FROM feed_posts 
+                    WHERE agent_id = ? 
+                    ORDER BY created_at DESC 
+                    LIMIT ?
+                    """,
+                    (agent_id, limit)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT id, created_at, text, rationale, sources_json 
+                    FROM feed_posts 
+                    ORDER BY created_at DESC 
+                    LIMIT ?
+                    """,
+                    (limit,)
+                ).fetchall()
 
             posts = []
             for r in rows:
                 try:
-                    sources = json.loads(r["sources_json"])
+                    raw_sources = json.loads(r["sources_json"])
+                    if isinstance(raw_sources, list):
+                        sources = [str(s) for s in raw_sources]
+                    elif isinstance(raw_sources, str):
+                        sources = [raw_sources]
+                    else:
+                        sources = []
                 except Exception:
                     sources = []
 
+                created_at_val = r["created_at"]
+                # Ensure ISO 8601 UTC format ends with Z
+                if created_at_val and isinstance(created_at_val, str) and not created_at_val.endswith("Z") and "+" not in created_at_val:
+                    created_at_val = f"{created_at_val}Z"
+
                 posts.append({
-                    "id": r["id"],
-                    "createdAt": r["created_at"],
-                    "text": r["text"],
-                    "rationale": r["rationale"],
+                    "id": str(r["id"]),
+                    "createdAt": str(created_at_val),
+                    "text": str(r["text"]),
+                    "rationale": str(r["rationale"]),
                     "sources": sources
                 })
             return posts

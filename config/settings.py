@@ -2,11 +2,10 @@
 Application settings using Pydantic Settings.
 
 Loads configuration from environment variables and .env file with resilient defaults:
-- Deployed EchoMind Backend API base URL (https://echomind-ltwo.onrender.com).
-- OpenRouter API credentials for LLM inference & web search.
-- Official X/Twitter API credentials for news publishing.
+- Deployed EchoMind Backend API base URL.
+- OpenRouter API credentials for LLM inference & live web search.
 - SQLite database storage path.
-- 5-Minute continuous discovery interval & 2-Hour publishing window duration.
+- ~35-Minute discovery interval with ±5-minute jitter & 2-Hour publishing window duration.
 - Configurable minimum news score threshold (default: 75.0).
 - Multi-agent cap (MAX_AGENTS = 5).
 """
@@ -43,41 +42,19 @@ class Settings(BaseSettings):
     # OpenRouter API (used for LLM inference & web search)
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
 
-    # Official X / Twitter API credentials
-    x_api_key: str = os.getenv("X_API_KEY", os.getenv("TWITTER_API_KEY", ""))
-    x_api_secret: str = os.getenv("X_API_SECRET", os.getenv("TWITTER_API_SECRET", ""))
-    x_access_token: str = os.getenv("X_ACCESS_TOKEN", os.getenv("TWITTER_ACCESS_TOKEN", ""))
-    x_access_token_secret: str = os.getenv("X_ACCESS_TOKEN_SECRET", os.getenv("TWITTER_ACCESS_SECRET", ""))
-    x_bearer_token: str = os.getenv("X_BEARER_TOKEN", os.getenv("TWITTER_BEARER_TOKEN", ""))
-    x_expected_handle: str = os.getenv("EXPECTED_X_HANDLE", os.getenv("X_EXPECTED_HANDLE", ""))
-
-    # Backwards-compatible aliases
-    twitter_api_key: str = os.getenv("TWITTER_API_KEY", os.getenv("X_API_KEY", ""))
-    twitter_api_secret: str = os.getenv("TWITTER_API_SECRET", os.getenv("X_API_SECRET", ""))
-    twitter_access_token: str = os.getenv("TWITTER_ACCESS_TOKEN", os.getenv("X_ACCESS_TOKEN", ""))
-    twitter_access_secret: str = os.getenv("TWITTER_ACCESS_SECRET", os.getenv("X_ACCESS_TOKEN_SECRET", ""))
-    twitter_bearer_token: str = os.getenv("TWITTER_BEARER_TOKEN", os.getenv("X_BEARER_TOKEN", ""))
-
     # Database & Storage configuration
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///agent_memory.db")
     agent_db_path: str = os.getenv("AGENT_DB_PATH", "agent_memory.db")
 
     # Publishing and cycle configuration
-    # Discovery runs every ~5 minutes; Publishing Window lasts 120 minutes (2 hours).
-    discovery_interval_minutes: int = int(os.getenv("DISCOVERY_INTERVAL_MINUTES", os.getenv("AGENT_INTERVAL_MINUTES", "5")))
-    publish_window_minutes: int = int(os.getenv("PUBLISH_WINDOW_MINUTES", "120"))
+    # Discovery runs every 30-45 minutes with ±5-min jitter (300s); Publishing Window matches discovery interval (45 min).
+    discovery_interval_minutes: int = int(os.getenv("DISCOVERY_INTERVAL_MINUTES", os.getenv("AGENT_INTERVAL_MINUTES", "45")))
+    discovery_jitter_seconds: int = int(os.getenv("DISCOVERY_JITTER_SECONDS", "300"))  # ±5 minutes
+    publish_window_minutes: int = int(os.getenv("PUBLISH_WINDOW_MINUTES", "45"))
     min_news_score: float = float(os.getenv("MIN_NEWS_SCORE", "75.0"))
 
     # Optional Admin API Secret for manual debug endpoints
     admin_api_key: str = os.getenv("ADMIN_API_KEY", "")
-
-    # Legacy flags preserved for backwards compatibility
-    agent_interval_minutes: int = int(os.getenv("AGENT_INTERVAL_MINUTES", "5"))
-    post_interval_minutes: int = 120
-    mentions_interval_minutes: int = 20
-    enable_image_generation: bool = False
-    use_unified_agent: bool = True
-    allow_mentions: bool = False
 
 
 # Global settings instance

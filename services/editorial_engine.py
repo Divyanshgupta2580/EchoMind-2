@@ -11,7 +11,10 @@ Implements deterministic multi-factor candidate scoring (0-100) and editorial ev
 Total: 100 points (Threshold: MIN_NEWS_SCORE = 75.0)
 
 Also handles:
-- Candidate pre-filtering against existing topic hashes in memory.
+- Two-layer deduplication:
+    Layer 1: Fast crypto-hash check against recent topic hashes (exact match).
+    Layer 2: LLM semantic check against the last 10 published posts
+             (catches paraphrases, rewordings, and conceptually identical stories).
 - Generation of high-value, authentic post text within 280 characters.
 - Generation of 3-part publishing rationale (Why selected, Why relevant now, Why chosen over others).
 - Source URL attribution.
@@ -179,6 +182,65 @@ class EditorialEngine:
 
         return total_score, breakdown, rejection_reason
 
+    async def _check_semantic_duplicate(
+        self,
+        agent_id: str,
+        candidate_title: str,
+        candidate_summary: str
+    ) -> tuple[bool, str | None]:
+        """
+        Ask the LLM whether a candidate is conceptually identical to any of the
+        last 10 published posts.  Returns (is_duplicate, matched_post_title_or_none).
+        """
+        if not self.memory:
+            return False, None
+
+        recent_posts = self.memory.get_feed(agent_id, limit=10)
+        if not recent_posts:
+            return False, None
+
+        # Build a numbered list of previously published headlines
+        published_lines = "\n".join(
+            f"{i+1}. {p['text'][:200]}" for i, p in enumerate(recent_posts)
+        )
+
+        system_prompt = (
+            "You are a strict editorial deduplication filter. "
+            "Your ONLY job is to decide if a proposed news candidate is "
+            "conceptually identical or substantially overlapping with any "
+            "previously published post. Minor wording differences, "
+            "reorderings, or paraphrases of the same core story all count "
+            "as duplicates.\n\n"
+            "Respond with EXACTLY one JSON object:\n"
+            '  {"is_duplicate": true, "matched_post": "<number or title>"}\n'
+            "or\n"
+            '  {"is_duplicate": false, "matched_post": null}'
+        )
+
+        user_prompt = (
+            "=== PREVIOUSLY PUBLISHED POSTS ===\n"
+            f"{published_lines}\n\n"
+            "=== NEW CANDIDATE ===\n"
+            f"Title: {candidate_title}\n"
+            f"Summary: {candidate_summary}\n\n"
+            "Is this new candidate conceptually identical to any of the "
+            "previously published posts listed above? "
+            "Reject it if it covers the same core story, finding, or announcement, "
+            "even if the wording is different."
+        )
+
+        try:
+            raw = await self.llm.generate(system=system_prompt, user=user_prompt)
+            # Parse the JSON response (tolerant of markdown fences)
+            cleaned = re.sub(r"```json?\s*|```", "", raw).strip()
+            data = json.loads(cleaned)
+            is_dup = bool(data.get("is_duplicate", False))
+            matched = data.get("matched_post")
+            return is_dup, str(matched) if matched else None
+        except Exception as e:
+            logger.warning(f"[EDITORIAL] Semantic dedup LLM check failed, allowing candidate through: {e}")
+            return False, None
+
     async def evaluate_candidate(
         self,
         agent_id: str,
@@ -189,12 +251,39 @@ class EditorialEngine:
         """
         Evaluate a single candidate, assign status (ELIGIBLE or REJECTED),
         and log decision.
+
+        Deduplication is two-layered:
+          1. Fast crypto-hash check against recent topic hashes (cheap, exact match).
+          2. LLM semantic check against the last 10 published posts (deep, conceptual match).
         """
         topic_hash = candidate.get("topic_hash") or self.memory.compute_topic_hash(candidate["title"])
         
-        # Check duplication
+        # --- Layer 1: Fast crypto-hash deduplication ---
         if topic_hash in recent_hashes or (self.memory and self.memory.is_candidate_hash_covered(agent_id, topic_hash)):
             reason = "Duplicate content: already covered in recent memory or previous published stories."
+            if self.memory:
+                self.memory.log_editorial_decision(agent_id, candidate["title"], "REJECTED", reason)
+            return {
+                "candidate": candidate,
+                "score": 0.0,
+                "breakdown": {"total": 0.0},
+                "status": "REJECTED",
+                "rejection_reason": reason,
+                "topic_hash": topic_hash
+            }
+
+        # --- Layer 2: LLM semantic deduplication ---
+        is_semantic_dup, matched_post = await self._check_semantic_duplicate(
+            agent_id,
+            candidate.get("title", ""),
+            candidate.get("summary", "")
+        )
+        if is_semantic_dup:
+            reason = (
+                f"Semantic duplicate: conceptually identical to previously published post "
+                f"(matched: {matched_post}). Rejected by LLM editorial filter."
+            )
+            logger.info(f"[EDITORIAL] Semantic dedup rejected '{candidate.get('title', '')}': {reason}")
             if self.memory:
                 self.memory.log_editorial_decision(agent_id, candidate["title"], "REJECTED", reason)
             return {
@@ -230,33 +319,39 @@ class EditorialEngine:
         leader_candidate: dict[str, Any]
     ) -> dict[str, Any]:
         """
-        Synthesize authentic X/Twitter post text (<= 280 chars), transparent rationale,
-        and source attribution for the selected window leader.
+        Synthesize authentic post text (<= 280 chars), transparent rationale,
+        and verified source attribution for the selected window leader.
+        Guarantees non-empty source URLs and strict JSON parsing.
         """
         title = leader_candidate["title"]
         summary = leader_candidate["summary"]
         source_urls = leader_candidate.get("source_urls", [])
         if isinstance(source_urls, str):
             source_urls = [source_urls]
+        
+        # Clean candidate source URLs
+        clean_candidate_sources = [
+            str(u).strip() for u in source_urls
+            if isinstance(u, str) and str(u).strip().startswith("http")
+        ]
 
         system_prompt = (
             f"You are {persona_profile['name']}, an autonomous authority in {persona_profile['domain']}.\n"
             f"Editorial stance: {persona_profile.get('editorial_stance', 'Evidence-based, skeptical, technical')}.\n"
             f"Writing style: {persona_profile.get('writing_style', 'Concise, rigorous, technical, no hype')}.\n\n"
-            f"CRITICAL CONSTRAINT: You are publishing an official post to X/Twitter. The post_text MUST be under 280 characters.\n"
-            f"Explain clearly what happened and why it matters technically without clickbait or emojis."
+            f"CRITICAL PUBLISHING CONSTRAINTS:\n"
+            f"1. post_text MUST be under 280 characters, technical, clear, and factual without clickbait or emojis.\n"
+            f"2. sources MUST be a JSON array containing the exact source URLs provided in Primary Sources. Under NO circumstances return an empty sources array.\n"
+            f"3. rationale MUST provide a 3-part justification: (a) Why selected, (b) Why relevant now, (c) Why chosen over alternative candidates."
         )
 
         user_prompt = (
-            f"Synthesize the official post for the selected winning story:\n"
+            f"Synthesize the official publication for the selected winning story:\n"
             f"Title: {title}\n"
             f"Summary: {summary}\n"
-            f"Primary Sources: {json.dumps(source_urls)}\n"
+            f"Primary Sources: {json.dumps(clean_candidate_sources)}\n"
             f"Candidate Score: {leader_candidate.get('score', 85.0)}\n\n"
-            f"Return JSON adhering to schema with:\n"
-            f"1. post_text: strictly <= 280 characters, technical, clear, factual.\n"
-            f"2. rationale: 3-part rationale (why selected, why relevant now, why chosen over others).\n"
-            f"3. sources: array of source URLs."
+            f"Return a strict JSON object with fields: 'post_text', 'rationale', 'sources'."
         )
 
         try:
@@ -270,11 +365,28 @@ class EditorialEngine:
             if len(post_text) > 280:
                 post_text = post_text[:277] + "..."
 
+            # Validate and clean extracted sources
+            extracted_sources = result.get("sources", [])
+            if isinstance(extracted_sources, str):
+                extracted_sources = [extracted_sources]
+
+            valid_sources = [
+                str(s).strip() for s in extracted_sources
+                if isinstance(s, str) and str(s).strip().startswith("http")
+            ]
+
+            # If LLM omitted or failed to return valid URLs, backfill from candidate's verified sources
+            if not valid_sources:
+                valid_sources = clean_candidate_sources
+
+            # Deduplicate while preserving order
+            final_sources = list(dict.fromkeys(valid_sources))
+
             return {
                 "text": post_text,
-                "rationale": result.get("rationale", f"Selected as window leader with score {leader_candidate.get('score', 85):.1f}."),
-                "sources": result.get("sources", source_urls),
-                "topic_hash": leader_candidate.get("topic_hash") or self.memory.compute_topic_hash(title)
+                "rationale": result.get("rationale", f"Selected as window leader with score {leader_candidate.get('score', 85):.1f}.").strip(),
+                "sources": final_sources,
+                "topic_hash": leader_candidate.get("topic_hash") or (self.memory.compute_topic_hash(title) if self.memory else AgentMemoryStore.compute_topic_hash(title))
             }
         except Exception as e:
             logger.warning(f"[EDITORIAL] LLM post synthesis fallback: {e}")
@@ -286,8 +398,8 @@ class EditorialEngine:
             return {
                 "text": raw_text,
                 "rationale": f"Selected as top-scoring candidate ({leader_candidate.get('score', 85):.1f}/100) meeting all verification criteria for {persona_profile['domain']}.",
-                "sources": source_urls,
-                "topic_hash": leader_candidate.get("topic_hash") or self.memory.compute_topic_hash(title)
+                "sources": clean_candidate_sources,
+                "topic_hash": leader_candidate.get("topic_hash") or (self.memory.compute_topic_hash(title) if self.memory else AgentMemoryStore.compute_topic_hash(title))
             }
 
     # Backwards-compatible evaluate_and_publish method

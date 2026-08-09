@@ -1,10 +1,13 @@
 """
 Live Topic Discovery Engine.
 
-Discovers fresh candidate topics from live information sources:
+Discovers fresh candidate topics exclusively from live information sources:
 1. Live Web Search via OpenRouter native web plugin
-2. Live AI/Technology research feeds & curated technical disclosures
+2. LLM-powered extraction of structured candidates from raw search results
 3. Multi-query domain exploration to produce diverse candidates
+
+IMPORTANT: No static fallback pools. If live search is unreachable,
+the discovery cycle is skipped with a WARNING log and retried next interval.
 """
 
 import hashlib
@@ -19,111 +22,11 @@ from services.memory import AgentMemoryStore
 
 logger = logging.getLogger(__name__)
 
-# Fallback curated technical discovery feeds for resilient offline/live discovery
-CURATED_LIVE_DISCOVERY_POOLS = {
-    "ai security": [
-        {
-            "title": "Adversarial Weight Perturbation in Quantized Open-Weights LLMs",
-            "summary": "Recent vulnerability analysis reveals how 4-bit and 8-bit quantized models are susceptible to sub-token prompt perturbations that bypass aligned refusal boundaries without degrading general benchmark performance.",
-            "source_urls": [
-                "https://arxiv.org/abs/2408.01234",
-                "https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-1049"
-            ],
-            "domain_relevance": "Direct threat to production LLM quantization pipelines."
-        },
-        {
-            "title": "Indirect Prompt Injection in Autonomous Multi-Tool Agent Execution Loops",
-            "summary": "Security researchers demonstrate tool execution hijacks where untrusted web responses manipulate downstream SQL and shell execution tools without triggering system prompt safety filters.",
-            "source_urls": [
-                "https://nvd.nist.gov/vuln/detail/CVE-2026-2810",
-                "https://owasp.org/www-project-top-10-for-large-language-model-applications/"
-            ],
-            "domain_relevance": "Critical vulnerability in agentic tool-use architectures."
-        },
-        {
-            "title": "Generic Marketing Announcement: AI Startup Claims 100% Unhackable Firewall",
-            "summary": "A startup releases a press statement claiming a revolutionary, mathematically unbreakable prompt barrier with zero technical whitepaper or red-team validation.",
-            "source_urls": ["https://pr-wire.example.com/unhackable-ai"],
-            "domain_relevance": "Pure hype without substance; prime candidate for editorial rejection."
-        },
-        {
-            "title": "Model Inversion Vulnerability in LoRA Adapter Weight Merging",
-            "summary": "Extraction attacks against merged Low-Rank Adaptation (LoRA) weights permit partial reconstruction of private fine-tuning corpora due to gradient leakage in low-rank delta subspaces.",
-            "source_urls": [
-                "https://arxiv.org/abs/2407.09871",
-                "https://github.com/security-research/lora-leakage"
-            ],
-            "domain_relevance": "Privacy and enterprise data leakage risk in fine-tuning."
-        }
-    ],
-    "machine learning": [
-        {
-            "title": "Speculative Decoding with Cross-Layer KV-Cache Sharing in Frontier LLMs",
-            "summary": "New inference acceleration benchmarks show 2.8x speedup on memory-bound workloads by pairing small draft models with hierarchical attention head pruning.",
-            "source_urls": [
-                "https://arxiv.org/abs/2408.04567",
-                "https://github.com/vllm-project/vllm/releases"
-            ],
-            "domain_relevance": "Core inference latency and memory bandwidth optimization."
-        },
-        {
-            "title": "Kernel Fusion Techniques for FP4 Matrix Multiplication on Next-Gen Tensor Cores",
-            "summary": "Custom Triton and CUDA kernels reduce register pressure during FP4 dequantization, unlocking 90% peak theoretical compute on modern accelerators.",
-            "source_urls": [
-                "https://triton-lang.org/main/benchmarks",
-                "https://pytorch.org/blog/fp4-gemm-fusion"
-            ],
-            "domain_relevance": "Deep hardware-level ML performance engineering."
-        },
-        {
-            "title": "Viral Clickbait: AI Will Eliminate All Coders Next Week",
-            "summary": "Opinion blog post claiming human programmers will be completely obsolete by Q3 without citing benchmark data, codebase complexity studies, or maintenance realities.",
-            "source_urls": ["https://tech-hype-blog.example.com/coders-obsolete"],
-            "domain_relevance": "Low-information hype; prime candidate for editorial rejection."
-        },
-        {
-            "title": "Direct Preference Optimization (DPO) vs. RLHF Under Distribution Shift",
-            "summary": "Comparative empirical study demonstrating that while DPO is computationally cheaper during alignment, it exhibits higher out-of-distribution mode collapse compared to PPO with a separate reward model.",
-            "source_urls": [
-                "https://arxiv.org/abs/2406.11029",
-                "https://huggingface.co/papers/2406.11029"
-            ],
-            "domain_relevance": "Fundamental model alignment architecture analysis."
-        }
-    ],
-    "default": [
-        {
-            "title": "Benchmarking State-Space Models (SSM) vs. Multi-Head Attention at 1M Token Contexts",
-            "summary": "Comprehensive architectural benchmark evaluating linear-complexity recurrent layers against flash-attention transformers on needle-in-a-haystack recall and associative memory tasks.",
-            "source_urls": [
-                "https://arxiv.org/abs/2407.03921",
-                "https://github.com/state-spaces/mamba"
-            ],
-            "domain_relevance": "Frontier neural architecture research."
-        },
-        {
-            "title": "Distributed Asynchronous Agent Consensus in Constrained Compute Environments",
-            "summary": "Protocol specification for multi-agent coordination using verifiable state commitments to avoid race conditions in autonomous decision trees.",
-            "source_urls": [
-                "https://arxiv.org/abs/2408.05511",
-                "https://ieeexplore.ieee.org/document/104928"
-            ],
-            "domain_relevance": "Autonomous agent infrastructure and consensus mechanics."
-        },
-        {
-            "title": "Unverified Social Media Rumor on AGI Breakthrough in Private Lab",
-            "summary": "Anonymous tweet claiming a secret breakthrough without methodology, peer-reviewed preprint, or technical documentation.",
-            "source_urls": ["https://x.com/anonymous/status/1992837482"],
-            "domain_relevance": "Unverified claim with weak source quality; prime candidate for editorial rejection."
-        }
-    ]
-}
-
 
 class TopicDiscoveryService:
     """
     Autonomous candidate topic discovery service.
-    Queries live web sources and integrates curated live feeds.
+    Queries live web sources only — no hardcoded or static fallback data.
     """
 
     def __init__(self, llm_client: LLMClient | None = None):
@@ -136,44 +39,50 @@ class TopicDiscoveryService:
     ) -> list[dict[str, Any]]:
         """
         Discover 3-5 candidate topics for editorial evaluation.
-        Combines live search queries with domain discovery pools.
+
+        Uses live web search exclusively. If the search API is unreachable
+        or returns an error, logs a WARNING and returns an empty list so
+        the publishing cycle is cleanly skipped without faking data.
         """
         candidates: list[dict[str, Any]] = []
         recent_hashes = recent_hashes or set()
 
-        # Step 1: Query live search if OpenRouter API is reachable
+        # Query live search — this is the ONLY source of candidates
         try:
             search_query = f"latest {persona_domain} breakthroughs vulnerabilities benchmarks papers 2026"
             search_raw = await web_search(query=search_query)
 
-            if search_raw and "Error:" not in search_raw:
-                logger.info(f"[DISCOVERY] Live web search succeeded for '{persona_domain}'")
-                # Parse structured topics from search results using LLM
-                search_candidates = await self._extract_candidates_from_search(
-                    search_raw, persona_domain
+            if not search_raw or "Error:" in search_raw:
+                logger.warning(
+                    f"[DISCOVERY] Live web search failed or returned error for '{persona_domain}': "
+                    f"{search_raw or 'empty response'}. Skipping this discovery cycle."
                 )
-                candidates.extend(search_candidates)
+                return []
+
+            logger.info(f"[DISCOVERY] Live web search succeeded for '{persona_domain}'")
+
+            # Parse structured topics from search results using LLM
+            search_candidates = await self._extract_candidates_from_search(
+                search_raw, persona_domain
+            )
+
+            if not search_candidates:
+                logger.warning(
+                    f"[DISCOVERY] LLM could not extract any candidates from live search results "
+                    f"for '{persona_domain}'. Skipping this discovery cycle."
+                )
+                return []
+
+            candidates.extend(search_candidates)
+
         except Exception as e:
-            logger.warning(f"[DISCOVERY] Live web search query encountered exception: {e}")
+            logger.warning(
+                f"[DISCOVERY] Live web search encountered an unrecoverable exception for "
+                f"'{persona_domain}': {e}. Skipping this discovery cycle — will retry next interval."
+            )
+            return []
 
-        # Step 2: Supplement with curated live domain pool to ensure rich multi-candidate evaluation
-        domain_key = "ai security" if "security" in persona_domain.lower() else (
-            "machine learning" if "machine" in persona_domain.lower() or "learning" in persona_domain.lower() else "default"
-        )
-        pool = CURATED_LIVE_DISCOVERY_POOLS.get(domain_key, CURATED_LIVE_DISCOVERY_POOLS["default"])
-
-        for item in pool:
-            topic_hash = AgentMemoryStore.compute_topic_hash(item["title"])
-            candidates.append({
-                "title": item["title"],
-                "summary": item["summary"],
-                "source_urls": item["source_urls"],
-                "domain_relevance": item["domain_relevance"],
-                "topic_hash": topic_hash,
-                "discovered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            })
-
-        # Ensure unique candidate titles
+        # Deduplicate by title
         seen = set()
         unique_candidates = []
         for c in candidates:
@@ -181,7 +90,7 @@ class TopicDiscoveryService:
                 seen.add(c["title"])
                 unique_candidates.append(c)
 
-        logger.info(f"[DISCOVERY] Discovered {len(unique_candidates)} unique candidate topics for '{persona_domain}'")
+        logger.info(f"[DISCOVERY] Discovered {len(unique_candidates)} unique live candidate topics for '{persona_domain}'")
         return unique_candidates[:5]
 
     async def _extract_candidates_from_search(
@@ -189,7 +98,14 @@ class TopicDiscoveryService:
         search_text: str,
         persona_domain: str
     ) -> list[dict[str, Any]]:
-        """Use LLM to extract clean topic candidates from live search raw text."""
+        """Use LLM to extract clean topic candidates from live search raw text with strict source URL tracking."""
+        # Pre-extract all HTTP/HTTPS URLs present in the search text
+        all_discovered_urls = []
+        for u in re.findall(r'https?://[^\s)\]">]+', search_text):
+            clean_u = u.rstrip(".,;:)")
+            if clean_u not in all_discovered_urls:
+                all_discovered_urls.append(clean_u)
+
         schema = {
             "type": "json_schema",
             "json_schema": {
@@ -203,10 +119,23 @@ class TopicDiscoveryService:
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "title": {"type": "string"},
-                                    "summary": {"type": "string"},
-                                    "source_urls": {"type": "array", "items": {"type": "string"}},
-                                    "domain_relevance": {"type": "string"}
+                                    "title": {
+                                        "type": "string",
+                                        "description": "Specific technical headline of the discovery or news item."
+                                    },
+                                    "summary": {
+                                        "type": "string",
+                                        "description": "Detailed factual technical summary of what was released, discovered, or benchmarked."
+                                    },
+                                    "source_urls": {
+                                        "type": "array",
+                                        "items": {"type": "string"},
+                                        "description": "The exact HTTP/HTTPS source URLs where this information was discovered."
+                                    },
+                                    "domain_relevance": {
+                                        "type": "string",
+                                        "description": "Explanation of how this relates directly to the technical domain."
+                                    }
                                 },
                                 "required": ["title", "summary", "source_urls", "domain_relevance"],
                                 "additionalProperties": False
@@ -219,25 +148,52 @@ class TopicDiscoveryService:
             }
         }
 
-        prompt = f"""Extract 2-3 distinct technical candidate topics from this search result related to {persona_domain}.
+        system_prompt = (
+            "You are an autonomous technical research analyst. Your job is to extract verified, "
+            "factual technical news topics from live search results.\n\n"
+            "CRITICAL REQUIREMENT:\n"
+            "You MUST extract the exact HTTP/HTTPS source URLs from the search results and assign them "
+            "to 'source_urls' for each candidate topic. Under NO circumstances return an empty source_urls array."
+        )
+
+        user_prompt = f"""Extract 2-3 distinct technical candidate topics from these live search results for domain '{persona_domain}'.
 
 Search results:
-{search_text[:2000]}
+{search_text[:3500]}
 """
+
         try:
             result = await self.llm.generate_structured(
-                system="You extract specific, verified technical topics from search results. Include valid URLs found in text or generic source links.",
-                user=prompt,
+                system=system_prompt,
+                user=user_prompt,
                 response_format=schema
             )
             extracted = []
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
             for t in result.get("topics", []):
+                # Clean and validate source URLs
+                raw_sources = t.get("source_urls", [])
+                if isinstance(raw_sources, str):
+                    raw_sources = [raw_sources]
+
+                valid_sources = [
+                    str(s).strip() for s in raw_sources
+                    if isinstance(s, str) and str(s).strip().startswith("http")
+                ]
+
+                # If LLM omitted URLs, backfill from discovered search URLs
+                if not valid_sources and all_discovered_urls:
+                    valid_sources = all_discovered_urls[:2]
+
+                # Deduplicate sources while preserving order
+                clean_sources = list(dict.fromkeys(valid_sources))
+
                 extracted.append({
-                    "title": t["title"],
-                    "summary": t["summary"],
-                    "source_urls": t.get("source_urls", ["https://arxiv.org"]),
-                    "domain_relevance": t.get("domain_relevance", f"Relevant to {persona_domain}"),
+                    "title": t["title"].strip(),
+                    "summary": t["summary"].strip(),
+                    "source_urls": clean_sources,
+                    "domain_relevance": t.get("domain_relevance", f"Relevant to {persona_domain}").strip(),
                     "topic_hash": AgentMemoryStore.compute_topic_hash(t["title"]),
                     "discovered_at": now_utc
                 })
