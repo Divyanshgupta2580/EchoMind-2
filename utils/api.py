@@ -1,26 +1,25 @@
 """
-OpenRouter API configuration.
+LLM Provider API configuration.
 
-Centralized constants and helper functions for OpenRouter API calls.
-Used by all services and tools that interact with OpenRouter.
+Centralized constants and helper functions for Gemini and Groq API calls.
 """
 
 from config.settings import settings
 
-# OpenRouter API endpoint
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
-def get_openrouter_headers() -> dict:
-    """
-    Get headers for OpenRouter API requests.
-
-    Returns:
-        dict: Headers including authorization, content type, and metadata.
-    """
+def get_gemini_headers() -> dict:
+    """Get default headers for Gemini API requests."""
     return {
-        "Authorization": f"Bearer {settings.openrouter_api_key}",
-        "Content-Type": "application/json",
-        "X-Title": "Autonomous AI & Technology Persona"
+        "Content-Type": "application/json"
     }
 
+
+def get_groq_headers() -> dict:
+    """Get authorization and content headers for Groq API requests."""
+    return {
+        "Authorization": f"Bearer {settings.groq_api_key}",
+        "Content-Type": "application/json"
+    }

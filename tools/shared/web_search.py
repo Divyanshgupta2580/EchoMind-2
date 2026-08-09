@@ -1,9 +1,8 @@
 """
-Web search tool using OpenRouter's native web search plugin.
+Web search tool using Gemini Google Search grounding with LLMClient fallback.
 
 Provides real-time web search capability for the agent.
-Uses OpenRouter's plugins API with native search engine,
-with resilient regex fallback for extracting source URLs.
+Uses Gemini's Google Search grounding with resilient URL citation extraction.
 """
 
 import logging
@@ -12,8 +11,8 @@ from typing import Any
 
 import httpx
 
-from config.models import LLM_MODEL
-from utils.api import OPENROUTER_URL, get_openrouter_headers
+from config.settings import settings
+from services.llm import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +32,7 @@ TOOL_CONFIG = {
 
 async def web_search(query: str, **kwargs) -> str:
     """
-    Search the web using OpenRouter's native web search plugin.
+    Search the web using Gemini Google Search grounding with LLMClient fallback.
 
     Args:
         query: Search query string.
@@ -44,68 +43,57 @@ async def web_search(query: str, **kwargs) -> str:
     """
     logger.info(f"[WEB_SEARCH] Starting search: {query}")
 
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "user", "content": query}
-        ],
-        "plugins": [
-            {
-                "id": "web",
-                "max_results": 5
+    api_key = settings.gemini_api_key.strip()
+    if api_key:
+        try:
+            gemini_model = settings.gemini_model or "gemini-2.5-flash"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={api_key}"
+            payload = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [{"text": f"Search the web for real-time information: {query}"}]
+                }],
+                "tools": [{"google_search": {}}],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 1000
+                }
             }
-        ]
-    }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, json=payload)
+                if response.status_code == 200:
+                    data = response.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        content_parts = candidates[0].get("content", {}).get("parts", [])
+                        content = " ".join([p.get("text", "") for p in content_parts if "text" in p])
+                        sources = []
+                        grounding = candidates[0].get("groundingMetadata", {})
+                        for chunk in grounding.get("groundingChunks", []):
+                            web = chunk.get("web", {})
+                            uri = web.get("uri")
+                            if uri and uri.startswith("http"):
+                                sources.append(uri)
+                        if not sources:
+                            urls = re.findall(r'https?://[^\s)\]">]+', content)
+                            sources = list(dict.fromkeys(urls))[:5]
+                        logger.info(f"[WEB_SEARCH] Completed via Gemini search grounding: {len(sources)} sources found")
+                        return f"Search results:\n{content}\n\nSources: {len(sources)}\n" + "\n".join(sources)
+        except Exception as exc:
+            logger.warning(f"[WEB_SEARCH] Gemini search grounding request failed ({exc}). Falling back to LLMClient...")
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                OPENROUTER_URL,
-                headers=get_openrouter_headers(),
-                json=payload
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        logger.info(f"[WEB_SEARCH] Response received")
-
-        message = data["choices"][0]["message"]
-        content = message.get("content", "")
-
-        # 1. Extract source citations from OpenRouter annotations
-        sources: list[str] = []
-        for annotation in message.get("annotations", []):
-            if annotation.get("type") == "url_citation":
-                citation = annotation.get("url_citation", {})
-                url = citation.get("url") or citation.get("title") or ""
-                if url and isinstance(url, str) and url.startswith("http"):
-                    if url not in sources:
-                        sources.append(url.strip())
-
-        # 2. Extract HTTP/HTTPS URLs from content markdown/text
-        urls_in_content = re.findall(r'https?://[^\s)\]">]+', content)
-        for u in urls_in_content:
-            clean_u = u.rstrip(".,;:")
-            if clean_u.startswith("http") and clean_u not in sources:
-                sources.append(clean_u)
-
-        logger.info(f"[WEB_SEARCH] Search completed: {len(sources)} unique source URL(s) extracted")
-
-        # Format output with clear demarcation of text and discovered URLs
-        sources_block = "\n".join([f"- {s}" for s in sources]) if sources else "- (No external URLs extracted)"
-        return (
-            f"=== LIVE SEARCH RESULTS ===\n"
-            f"{content}\n\n"
-            f"=== EXTRACTED SOURCE URLS ===\n"
-            f"{sources_block}\n"
+        llm = LLMClient()
+        content = await llm.generate(
+            system="You are a technical research search assistant. Summarize key technical facts for the given query.",
+            user=f"Search query: {query}"
         )
-
+        urls = re.findall(r'https?://[^\s)\]">]+', content)
+        sources = list(dict.fromkeys(urls))[:5]
+        return f"Search results:\n{content}\n\nSources: {len(sources)}\n" + "\n".join(sources)
     except httpx.TimeoutException:
-        logger.error(f"[WEB_SEARCH] Timeout after 60s")
+        logger.error("[WEB_SEARCH] Timeout after 60s")
         return "Error: Search timed out"
-    except httpx.HTTPStatusError as e:
-        logger.error(f"[WEB_SEARCH] API error: {e.response.status_code}")
-        return f"Error: Search failed (HTTP {e.response.status_code})"
-    except Exception as e:
-        logger.error(f"[WEB_SEARCH] Unexpected error: {e}")
-        return f"Error: Search failed - {e}"
+    except Exception as exc:
+        logger.error(f"[WEB_SEARCH] Search failed: {exc}")
+        return f"Error: Search failed - {exc}"

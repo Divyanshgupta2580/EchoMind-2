@@ -3,7 +3,7 @@ Application settings using Pydantic Settings.
 
 Loads configuration from environment variables and .env file with resilient defaults:
 - Deployed EchoMind Backend API base URL.
-- OpenRouter API credentials for LLM inference & live web search.
+- Gemini Primary & Groq Fallback API credentials for LLM inference & live web search.
 - SQLite database storage path.
 - ~35-Minute discovery interval with ±5-minute jitter & 2-Hour publishing window duration.
 - Configurable minimum news score threshold (default: 75.0).
@@ -39,8 +39,17 @@ class Settings(BaseSettings):
     # Multi-agent capacity limit (default: 5)
     max_agents: int = int(os.getenv("MAX_AGENTS", "5"))
 
-    # OpenRouter API (used for LLM inference & web search)
-    openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
+    # Gemini API Configuration (Primary LLM)
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+    # Groq API Configuration (Fallback LLM)
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    # Provider Priority
+    llm_primary_provider: str = os.getenv("LLM_PRIMARY_PROVIDER", "gemini")
+    llm_fallback_provider: str = os.getenv("LLM_FALLBACK_PROVIDER", "groq")
 
     # Database & Storage configuration
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///agent_memory.db")
