@@ -562,7 +562,9 @@ class AgentMemoryStore:
         """Get the most recent window for an agent regardless of status."""
         with self._get_connection() as conn:
             row = conn.execute(
-                "SELECT * FROM publishing_windows WHERE agent_id = ? ORDER BY started_at DESC LIMIT 1",
+                # Windows created and closed within the same second have equal
+                # ISO timestamps; rowid makes restart recovery deterministic.
+                "SELECT * FROM publishing_windows WHERE agent_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1",
                 (agent_id,)
             ).fetchone()
             if row:

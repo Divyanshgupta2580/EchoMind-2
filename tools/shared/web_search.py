@@ -1,18 +1,16 @@
 """
-Web search tool using Gemini Google Search grounding with LLMClient fallback.
+Web search tool using Gemini Google Search grounding.
 
 Provides real-time web search capability for the agent.
 Uses Gemini's Google Search grounding with resilient URL citation extraction.
 """
 
 import logging
-import re
 from typing import Any
 
 import httpx
 
 from config.settings import settings
-from services.llm import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +30,7 @@ TOOL_CONFIG = {
 
 async def web_search(query: str, **kwargs) -> str:
     """
-    Search the web using Gemini Google Search grounding with LLMClient fallback.
+    Search the web using Gemini Google Search grounding.
 
     Args:
         query: Search query string.
@@ -74,26 +72,17 @@ async def web_search(query: str, **kwargs) -> str:
                             uri = web.get("uri")
                             if uri and uri.startswith("http"):
                                 sources.append(uri)
+                        sources = list(dict.fromkeys(sources))
                         if not sources:
-                            urls = re.findall(r'https?://[^\s)\]">]+', content)
-                            sources = list(dict.fromkeys(urls))[:5]
+                            logger.warning("[WEB_SEARCH] Gemini returned no grounding source URLs")
+                            return "Error: Gemini live search returned no verified sources"
                         logger.info(f"[WEB_SEARCH] Completed via Gemini search grounding: {len(sources)} sources found")
                         return f"Search results:\n{content}\n\nSources: {len(sources)}\n" + "\n".join(sources)
+        except httpx.TimeoutException:
+            logger.warning("[WEB_SEARCH] Gemini search grounding timed out")
         except Exception as exc:
-            logger.warning(f"[WEB_SEARCH] Gemini search grounding request failed ({exc}). Falling back to LLMClient...")
+            logger.warning(f"[WEB_SEARCH] Gemini search grounding request failed: {exc}")
 
-    try:
-        llm = LLMClient()
-        content = await llm.generate(
-            system="You are a technical research search assistant. Summarize key technical facts for the given query.",
-            user=f"Search query: {query}"
-        )
-        urls = re.findall(r'https?://[^\s)\]">]+', content)
-        sources = list(dict.fromkeys(urls))[:5]
-        return f"Search results:\n{content}\n\nSources: {len(sources)}\n" + "\n".join(sources)
-    except httpx.TimeoutException:
-        logger.error("[WEB_SEARCH] Timeout after 60s")
-        return "Error: Search timed out"
-    except Exception as exc:
-        logger.error(f"[WEB_SEARCH] Search failed: {exc}")
-        return f"Error: Search failed - {exc}"
+    # A model completion cannot prove that its facts or URLs are current.  The
+    # caller may use its independent live-source fallback instead.
+    return "Error: Gemini live search unavailable"

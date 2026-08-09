@@ -334,6 +334,9 @@ class EditorialEngine:
             str(u).strip() for u in source_urls
             if isinstance(u, str) and str(u).strip().startswith("http")
         ]
+        clean_candidate_sources = list(dict.fromkeys(clean_candidate_sources))
+        if not clean_candidate_sources:
+            raise ValueError("Cannot synthesize a post without verified candidate sources")
 
         system_prompt = (
             f"You are {persona_profile['name']}, an autonomous authority in {persona_profile['domain']}.\n"
@@ -361,6 +364,8 @@ class EditorialEngine:
                 schema=EDITORIAL_SYNTHESIS_SCHEMA
             )
             post_text = result.get("post_text", "").strip()
+            if not post_text:
+                raise ValueError("Structured response has an empty post_text")
             # Enforce 280 character limit
             if len(post_text) > 280:
                 post_text = post_text[:277] + "..."
@@ -372,7 +377,7 @@ class EditorialEngine:
 
             valid_sources = [
                 str(s).strip() for s in extracted_sources
-                if isinstance(s, str) and str(s).strip().startswith("http")
+                if isinstance(s, str) and str(s).strip() in clean_candidate_sources
             ]
 
             # If LLM omitted or failed to return valid URLs, backfill from candidate's verified sources
@@ -382,15 +387,19 @@ class EditorialEngine:
             # Deduplicate while preserving order
             final_sources = list(dict.fromkeys(valid_sources))
 
+            rationale = result.get("rationale", "").strip()
+            if not rationale:
+                raise ValueError("Structured response has an empty rationale")
             return {
                 "text": post_text,
-                "rationale": result.get("rationale", f"Selected as window leader with score {leader_candidate.get('score', 85):.1f}.").strip(),
+                "rationale": rationale,
                 "sources": final_sources,
                 "topic_hash": leader_candidate.get("topic_hash") or (self.memory.compute_topic_hash(title) if self.memory else AgentMemoryStore.compute_topic_hash(title))
             }
         except Exception as e:
             logger.warning(f"[EDITORIAL] LLM post synthesis fallback: {e}")
-            # Resilient fallback synthesis
+            # Deterministic fallback only restates already verified candidate
+            # data and preserves its discovered source URLs.
             raw_text = f"{title}: {summary}"
             if len(raw_text) > 277:
                 raw_text = raw_text[:274] + "..."

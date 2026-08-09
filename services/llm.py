@@ -55,6 +55,50 @@ def _clean_and_parse_json(text: str) -> dict[str, Any]:
     return json.loads(clean)
 
 
+def _validate_structured_response(data: Any, response_format: dict[str, Any]) -> dict[str, Any]:
+    """Validate provider JSON at the application boundary.
+
+    Gemini may enforce a schema at the provider; Groq's JSON-object mode does
+    not.  This common validation makes their application contract equivalent
+    without claiming identical provider guarantees.
+    """
+    schema = response_format.get("json_schema", {}).get("schema", response_format)
+
+    def validate(value: Any, definition: dict[str, Any], path: str) -> None:
+        expected = definition.get("type")
+        if expected == "object":
+            if not isinstance(value, dict):
+                raise ValueError(f"{path} must be an object")
+            required = definition.get("required", [])
+            missing = [field for field in required if field not in value]
+            if missing:
+                raise ValueError(f"{path} missing required fields: {', '.join(missing)}")
+            properties = definition.get("properties", {})
+            if definition.get("additionalProperties") is False:
+                unexpected = set(value) - set(properties)
+                if unexpected:
+                    raise ValueError(f"{path} contains unexpected fields: {', '.join(sorted(unexpected))}")
+            for field, field_schema in properties.items():
+                if field in value:
+                    validate(value[field], field_schema, f"{path}.{field}")
+        elif expected == "array":
+            if not isinstance(value, list):
+                raise ValueError(f"{path} must be an array")
+            item_schema = definition.get("items")
+            if item_schema:
+                for index, item in enumerate(value):
+                    validate(item, item_schema, f"{path}[{index}]")
+        elif expected == "string" and not isinstance(value, str):
+            raise ValueError(f"{path} must be a string")
+        elif expected == "number" and (not isinstance(value, (int, float)) or isinstance(value, bool)):
+            raise ValueError(f"{path} must be a number")
+        elif expected == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"{path} must be a boolean")
+
+    validate(data, schema, "response")
+    return data
+
+
 def _extract_content_from_data(data: dict[str, Any]) -> str:
     """Extract output text from either OpenAI/Groq 'choices' or Gemini 'candidates' structure."""
     if "choices" in data and data["choices"]:
@@ -120,14 +164,14 @@ class LLMClient:
         # Try Gemini Primary
         try:
             raw_text = await self._call_gemini_text(system=system, user=user, target_schema=target_schema, is_json=True)
-            return _clean_and_parse_json(raw_text)
+            return _validate_structured_response(_clean_and_parse_json(raw_text), target_schema)
         except Exception as exc:
             logger.warning(f"[LLM] Gemini primary structured generation failed ({exc}). Attempting Groq fallback...")
 
         # Try Groq Fallback
         try:
             raw_text = await self._call_groq_text(messages=messages, target_schema=target_schema, is_json=True)
-            return _clean_and_parse_json(raw_text)
+            return _validate_structured_response(_clean_and_parse_json(raw_text), target_schema)
         except Exception as exc:
             logger.error(f"[LLM] Both Gemini and Groq providers failed structured generation: {exc}")
             raise
@@ -162,7 +206,7 @@ class LLMClient:
                 is_json=is_json
             )
             if is_json:
-                return _clean_and_parse_json(raw_text)
+                return _validate_structured_response(_clean_and_parse_json(raw_text), response_format or {})
             return {"content": raw_text}
         except Exception as exc:
             logger.warning(f"[LLM] Gemini primary chat failed ({exc}). Attempting Groq fallback...")
@@ -171,7 +215,7 @@ class LLMClient:
         try:
             raw_text = await self._call_groq_text(messages=messages, target_schema=response_format, is_json=is_json)
             if is_json:
-                return _clean_and_parse_json(raw_text)
+                return _validate_structured_response(_clean_and_parse_json(raw_text), response_format or {})
             return {"content": raw_text}
         except Exception as exc:
             logger.error(f"[LLM] Both Gemini and Groq providers failed chat: {exc}")
@@ -221,6 +265,8 @@ class LLMClient:
                 )
                 if is_json:
                     config.response_mime_type = "application/json"
+                    if target_schema:
+                        config.response_json_schema = target_schema.get("json_schema", {}).get("schema", target_schema)
 
                 sdk_contents = []
                 for item in contents:
@@ -254,6 +300,8 @@ class LLMClient:
             payload["system_instruction"] = {"parts": [{"text": system}]}
         if is_json:
             payload["generationConfig"]["responseMimeType"] = "application/json"
+            if target_schema:
+                payload["generationConfig"]["responseSchema"] = target_schema.get("json_schema", {}).get("schema", target_schema)
         if target_schema:
             payload["response_format"] = target_schema
 
@@ -285,6 +333,8 @@ class LLMClient:
                     "temperature": 0.7,
                 }
                 if is_json:
+                    # Groq guarantees JSON syntax here, not provider-level schema
+                    # enforcement; _validate_structured_response enforces ours.
                     kwargs["response_format"] = {"type": "json_object"}
 
                 response = await client.chat.completions.create(**kwargs)
@@ -306,9 +356,7 @@ class LLMClient:
             "max_tokens": 1200,
             "temperature": 0.7
         }
-        if target_schema:
-            payload["response_format"] = target_schema
-        elif is_json:
+        if is_json:
             payload["response_format"] = {"type": "json_object"}
 
         async with httpx.AsyncClient(timeout=45.0) as client:

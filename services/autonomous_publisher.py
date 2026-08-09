@@ -46,12 +46,16 @@ class AutonomousPublisherService:
     def __init__(
         self,
         memory: AgentMemoryStore | None = None,
-        llm: LLMClient | None = None
+        llm: LLMClient | None = None,
+        publisher: Any | None = None,
     ):
         self.memory = memory or memory_store
         self.llm = llm or LLMClient()
         self.discovery = TopicDiscoveryService(self.llm)
         self.editorial = EditorialEngine(self.llm, self.memory)
+        # Social publishing is deliberately optional.  The SQLite feed is the
+        # product contract and no external publisher is allowed to block it.
+        self.publisher = publisher
         self._agent_locks: dict[str, asyncio.Lock] = {}
 
     def _get_agent_lock(self, agent_id: str) -> asyncio.Lock:
@@ -95,7 +99,17 @@ class AutonomousPublisherService:
         # Step 3: Run candidate discovery from live sources
         recent_hashes = self.memory.get_recent_topic_hashes(agent_id, limit=50)
         profile = build_persona_profile(agent["name"], agent["domain"])
-        raw_candidates = await self.discovery.discover_candidate_topics(agent["domain"], recent_hashes)
+        try:
+            raw_candidates = await self.discovery.discover_candidate_topics(agent["domain"], recent_hashes)
+        except Exception as exc:
+            # Retrieval failures are expected to be transient.  Keep the
+            # scheduler and feed endpoint alive and try again next interval.
+            logger.warning("[DISCOVERY] Live source failure for %s: %s", agent_id, exc)
+            return {
+                "success": False,
+                "action": "discovery_failed",
+                "window_id": window_id,
+            }
         logger.info(f"[DISCOVERY] Found {len(raw_candidates)} candidate topics for window {window_id}")
 
         # Step 4: Evaluate and persist each candidate
@@ -215,7 +229,34 @@ class AutonomousPublisherService:
 
         # Final editorial validation and synthesis
         logger.info(f"[SELECTION] Selected winning candidate: '{leader['title']}' with score={leader['score']:.1f}")
-        post_data = await self.editorial.synthesize_post_for_leader(agent_id, profile, leader)
+        try:
+            post_data = await self.editorial.synthesize_post_for_leader(agent_id, profile, leader)
+        except Exception as exc:
+            logger.warning("[PUBLISH] Refusing publication for invalid synthesis: %s", exc)
+            self.memory.close_window(window_id=window_id, status="NO_QUALIFIED_STORY")
+            new_window = self.memory.create_window(agent_id, duration_minutes=settings.publish_window_minutes)
+            return {
+                "success": True,
+                "action": "no_publication",
+                "window_status": "NO_QUALIFIED_STORY",
+                "closed_window_id": window_id,
+                "next_window_id": new_window["window_id"],
+            }
+
+        trusted_sources = leader.get("source_urls", [])
+        if isinstance(trusted_sources, str):
+            trusted_sources = [trusted_sources]
+        if not post_data["sources"] or not set(post_data["sources"]).issubset(set(trusted_sources)):
+            logger.warning("[PUBLISH] Refusing publication with non-discovered source URLs")
+            self.memory.close_window(window_id=window_id, status="NO_QUALIFIED_STORY")
+            new_window = self.memory.create_window(agent_id, duration_minutes=settings.publish_window_minutes)
+            return {
+                "success": True,
+                "action": "no_publication",
+                "window_status": "NO_QUALIFIED_STORY",
+                "closed_window_id": window_id,
+                "next_window_id": new_window["window_id"],
+            }
 
         # Publish directly to SQLite feed_posts table
         post_id = f"p-{uuid.uuid4().hex[:8]}"
